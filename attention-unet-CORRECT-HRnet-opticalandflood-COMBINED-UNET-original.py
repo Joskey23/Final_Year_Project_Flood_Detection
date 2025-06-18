@@ -1,0 +1,3241 @@
+#!/usr/bin/env python
+"""
+Enhanced HRNet+OCR for Water Detection
+Training on HandLabeled data with S1Hand, S2Hand, LabelHand, and JRCWaterHand
+"""
+
+import os
+import random
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import math
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
+import rasterio
+from skimage import morphology
+from PIL import Image
+import torchvision.transforms.functional as TF
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Set seeds for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Attention U-Net for Flood Detection')
+    # Add existing arguments from original code...
+    parser.add_argument('--data_root', type=str, default="/mnt/z/Formal data_v1.1", help='Root data directory')
+    parser.add_argument('--optical_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/S2Hand", help='Directory containing optical imagery (for NDWI)')
+    parser.add_argument('--s1_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/S1Hand", help='Directory containing SAR imagery')
+    parser.add_argument('--label_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/LabelHand", help='Directory containing label masks')
+    parser.add_argument('--jrc_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/JRCWaterHand", help='Directory containing JRC permanent water')
+    parser.add_argument('--min_water_percent', type=float, default=0.01, help='Minimum water percentage to include sample')
+    parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
+    parser.add_argument('--epochs', type=int, default=75, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--patch_size', type=int, default=256, help='Patch size for training')
+    parser.add_argument('--perm_water_weight', type=float, default=2.0, help='Weight for permanent water class')
+    parser.add_argument('--flood_water_weight', type=float, default=4.0, help='Weight for flood water class')
+    parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to pretrained model')
+    parser.add_argument('--max_samples', type=int, default=2000, help='Maximum samples to use')
+    parser.add_argument('--augmentation_intensity', type=str, default='strong', choices=['light', 'medium', 'strong'], 
+                       help='Level of data augmentation to apply')
+    parser.add_argument('--include_ndwi', type=bool, default=False, help='Include NDWI as additional channel')
+    parser.add_argument('--include_jrc', type=bool, default=True, help='Include JRC permanent water as additional channel')
+    parser.add_argument('--num_classes', type=int, default=3, help='Number of classes (0:background, 1:perm_water, 2:flood)')
+    parser.add_argument('--use_crf', type=bool, default=True, help='Use CRF for post-processing')
+    parser.add_argument('--filters_base', type=int, default=64, help='Base filters for the Attention U-Net')
+    parser.add_argument('--water_index', type=str, default='ndwi', choices=['ndwi', 'mndwi', 'ndpi'], 
+                       help='Water index calculation method')
+    parser.add_argument('--loss_type', type=str, default='combined', 
+                       choices=['combined', 'boundary', 'flood'], help='Loss function to use')
+    parser.add_argument('--boundary_weight', type=float, default=5.0, help='Weight for boundary pixels in boundary-aware loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+    parser.add_argument('--output_dir', type=str, default='/mnt/z/Formal data_v1.1/results_attn_unet_flooddetector_NONDWI', help='Directory to save outputs')
+    parser.add_argument('--resume_training', type=bool, default=False, help='Resume training from checkpoint')
+    parser.add_argument('--use_morphological_postprocessing', type=bool, default=True, 
+                       help='Apply morphological post-processing to predictions')
+    # Add new argument for evaluation configurations
+    parser.add_argument('--eval_configs', nargs='+', type=str, 
+                       default=['full', 'sar_only'], 
+                       help='Input configurations to evaluate with (full, sar_only)')
+    parser.add_argument('--morph_min_size', type=int, default=5, 
+                   help='Minimum size threshold for morphological operations')
+    args = parser.parse_args()
+
+#######################
+# Model Implementation
+#######################
+
+class AttentionGate(nn.Module):
+    """Attention Gate for focusing on relevant features"""
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        
+        return x * psi
+
+class ConvBlock(nn.Module):
+    """Double convolution block for U-Net"""
+    def __init__(self, in_ch, out_ch):
+        super(ConvBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, x):
+        return self.conv(x)
+
+class UpBlock(nn.Module):
+    """Upsampling block with attention for U-Net"""
+    def __init__(self, in_ch, out_ch, bilinear=True):
+        super(UpBlock, self).__init__()
+        self.attention = AttentionGate(F_g=in_ch//2, F_l=in_ch//2, F_int=in_ch//4)
+        
+        if bilinear:
+            self.up = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+                nn.Conv2d(in_ch, in_ch//2, kernel_size=1, stride=1, padding=0, bias=True)
+            )
+        else:
+            self.up = nn.ConvTranspose2d(in_ch, in_ch//2, kernel_size=2, stride=2)
+            
+        self.conv = ConvBlock(in_ch, out_ch)
+        
+    def forward(self, x1, x2):
+        # x1 is from encoder, x2 is from previous decoder stage
+        x2 = self.up(x2)
+        
+        # Handle potential size mismatch
+        diffY = x1.size()[2] - x2.size()[2]
+        diffX = x1.size()[3] - x2.size()[3]
+        
+        x2 = F.pad(x2, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        
+        # Apply attention mechanism
+        x1 = self.attention(g=x2, x=x1)
+        
+        # Concatenate
+        x = torch.cat([x1, x2], dim=1)
+        return self.conv(x)
+
+class AttentionUNet(nn.Module):
+    """Attention U-Net for water detection"""
+    def __init__(self, n_channels, n_classes, filters_base=64):
+        super(AttentionUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        
+        # Encoder path
+        self.inc = ConvBlock(n_channels, filters_base)
+        self.down1 = nn.Sequential(
+            nn.MaxPool2d(2),
+            ConvBlock(filters_base, filters_base*2)
+        )
+        self.down2 = nn.Sequential(
+            nn.MaxPool2d(2),
+            ConvBlock(filters_base*2, filters_base*4)
+        )
+        self.down3 = nn.Sequential(
+            nn.MaxPool2d(2),
+            ConvBlock(filters_base*4, filters_base*8)
+        )
+        self.down4 = nn.Sequential(
+            nn.MaxPool2d(2),
+            ConvBlock(filters_base*8, filters_base*16)
+        )
+        
+        # Decoder path with attention
+        self.up4 = UpBlock(filters_base*16, filters_base*8)
+        self.up3 = UpBlock(filters_base*8, filters_base*4)
+        self.up2 = UpBlock(filters_base*4, filters_base*2)
+        self.up1 = UpBlock(filters_base*2, filters_base)
+        
+        # Output layer
+        self.outc = nn.Conv2d(filters_base, n_classes, kernel_size=1)
+        
+        # Auxiliary outputs for deep supervision
+        self.aux_out3 = nn.Conv2d(filters_base*4, n_classes, kernel_size=1)
+        self.aux_out2 = nn.Conv2d(filters_base*2, n_classes, kernel_size=1)
+        self.aux_out1 = nn.Conv2d(filters_base, n_classes, kernel_size=1)
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+    def forward(self, x):
+        # Record input size for upsampling later
+        input_size = (x.size()[2], x.size()[3])
+        
+        # Encoder path
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        
+        # Decoder path with attention gates
+        x = self.up4(x4, x5)
+        x = self.up3(x3, x)
+        aux3 = self.aux_out3(x)
+        
+        x = self.up2(x2, x)
+        aux2 = self.aux_out2(x)
+        
+        x = self.up1(x1, x)
+        aux1 = self.aux_out1(x)
+        
+        # Main output
+        main_output = self.outc(x)
+        
+        # Resize all outputs to match input size
+        aux3 = F.interpolate(aux3, size=input_size, mode='bilinear', align_corners=True)
+        aux2 = F.interpolate(aux2, size=input_size, mode='bilinear', align_corners=True)
+        aux1 = F.interpolate(aux1, size=input_size, mode='bilinear', align_corners=True)
+        main_output = F.interpolate(main_output, size=input_size, mode='bilinear', align_corners=True)
+        
+        # Return main output and auxiliary outputs during training
+        if self.training:
+            # Structure it to be compatible with our loss function
+            return main_output, (aux1, aux2, aux3)
+        else:
+            # Return only the main output for inference
+            return main_output
+#######################
+# Loss Functions
+#######################
+
+class CombinedLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, alpha=0.5, ignore_index=255):
+        super(CombinedLoss, self).__init__()
+        self.ce_loss = FocalLoss(weight=weight, gamma=gamma, ignore_index=ignore_index)
+        self.alpha = alpha
+        self.ignore_index = ignore_index
+        
+    def forward(self, inputs, targets):
+        # Handle tuple inputs (for auxiliary outputs)
+        if isinstance(inputs, tuple):
+            main_out, aux_out = inputs
+            # Main loss (OCR output)
+            ce_loss_main = self.ce_loss(main_out, targets)
+            dice_loss_main = self._dice_loss(main_out, targets)
+            main_loss = (1 - self.alpha) * ce_loss_main + self.alpha * dice_loss_main
+            
+            # Auxiliary loss (weighted less)
+            ce_loss_aux = self.ce_loss(aux_out, targets)
+            dice_loss_aux = self._dice_loss(aux_out, targets)
+            aux_loss = (1 - self.alpha) * ce_loss_aux + self.alpha * dice_loss_aux
+            
+            # Combined loss with auxiliary weighted at 0.4
+            return main_loss + 0.4 * aux_loss
+        else:
+            # Single output case
+            ce_loss = self.ce_loss(inputs, targets)
+            dice_loss = self._dice_loss(inputs, targets)
+            return (1 - self.alpha) * ce_loss + self.alpha * dice_loss
+    
+    def _dice_loss(self, inputs, targets):
+        # Dice loss component
+        probs = F.softmax(inputs, dim=1)
+        batch_size, num_classes = probs.shape[0], probs.shape[1]
+        
+        # Create mask for valid pixels
+        mask = (targets != self.ignore_index).float().unsqueeze(1)
+        
+        # One-hot encode targets
+        targets_one_hot = F.one_hot(
+            torch.clamp(targets, 0, num_classes - 1), 
+            num_classes=num_classes
+        ).permute(0, 3, 1, 2).float()
+        
+        # Apply mask
+        targets_one_hot = targets_one_hot * mask
+        probs = probs * mask
+        
+        # Calculate Dice coefficient for each class and batch
+        intersection = (probs * targets_one_hot).sum(dim=(2, 3))
+        union = probs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+        
+        # Apply smooth factor
+        smooth = 1e-8
+        dice = (2. * intersection + smooth) / (union + smooth)
+        
+        # Average over classes and batches
+        dice_loss = 1 - dice.mean()
+        
+        return dice_loss
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, reduction='mean', ignore_index=255):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+        
+    def forward(self, inputs, targets):
+        # Get probabilities
+        log_softmax = F.log_softmax(inputs, dim=1)
+        log_probs = log_softmax
+        probs = torch.exp(log_probs)
+        
+        # Create a mask for ignored indices
+        mask = (targets != self.ignore_index).float()
+        
+        # One-hot encoding of targets
+        targets_one_hot = F.one_hot(
+            torch.clamp(targets, 0, inputs.shape[1] - 1), 
+            num_classes=inputs.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        
+        # Apply focal weighting
+        focal_weight = (1 - probs)**self.gamma
+        focal_loss = -focal_weight * targets_one_hot * log_probs
+        
+        # Apply class weights if provided
+        if self.weight is not None:
+            focal_loss = focal_loss * self.weight.view(1, -1, 1, 1)
+        
+        # Apply ignore mask
+        focal_loss = focal_loss * mask.unsqueeze(1)
+        
+        # Reduce appropriately
+        if self.reduction == 'mean':
+            return focal_loss.sum() / (mask.sum() + 1e-8)
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+class DiceLoss(nn.Module):
+    def __init__(self, weight=None, smooth=1e-5, ignore_index=255):
+        super(DiceLoss, self).__init__()
+        self.weight = weight
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        
+    def forward(self, inputs, targets):
+        # Get probabilities
+        probs = F.softmax(inputs, dim=1)
+        batch_size, num_classes = probs.shape[0], probs.shape[1]
+        
+        # Create mask for valid pixels
+        mask = (targets != self.ignore_index).float().unsqueeze(1)
+        
+        # One-hot encode targets
+        targets_one_hot = F.one_hot(
+            torch.clamp(targets, 0, num_classes - 1), 
+            num_classes=num_classes
+        ).permute(0, 3, 1, 2).float()
+        
+        # Apply mask
+        targets_one_hot = targets_one_hot * mask
+        probs = probs * mask
+        
+        # Calculate Dice coefficient for each class and batch
+        if self.weight is not None:
+            w = self.weight.view(1, -1, 1, 1)
+            intersection = w * (probs * targets_one_hot).sum(dim=(2, 3))
+            union = w * (probs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3)))
+        else:
+            intersection = (probs * targets_one_hot).sum(dim=(2, 3))
+            union = probs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+        
+        # Calculate Dice loss
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        
+        # Average over classes and batches
+        dice_loss = 1 - dice.mean()
+        
+        return dice_loss
+
+class AdvancedFloodLoss(nn.Module):
+    def __init__(self, weight=None, ignore_index=255, small_object_boost=3.0, 
+                 flood_weight=6.0, perm_weight=8.0, focal_gamma=2.5):
+        super(AdvancedFloodLoss, self).__init__()
+        
+        # Initialize weights if not provided
+        if weight is None:
+            if torch.cuda.is_available():
+                weight = torch.tensor([1.0, perm_weight, flood_weight]).cuda()
+            else:
+                weight = torch.tensor([1.0, perm_weight, flood_weight])
+        
+        self.focal = FocalLoss(weight=weight, gamma=focal_gamma, ignore_index=ignore_index)
+        self.dice = DiceLoss(weight=weight, ignore_index=ignore_index)
+        self.boundary = BoundaryAwareLoss(weight=weight, ignore_index=ignore_index, boundary_weight=7.0)
+        self.small_object_boost = small_object_boost
+        self.ignore_index = ignore_index
+        self.weight = weight
+        
+    def forward(self, inputs, targets):
+        # Handle different output structures from different models
+        if isinstance(inputs, tuple):
+            # For Attention U-Net: inputs = (main_output, (aux1, aux2, aux3))
+            main_out = inputs[0]
+            
+            # Get the auxiliary outputs - could be a tuple of tensors
+            aux_outputs = inputs[1]
+            
+            # Calculate loss for main output
+            main_loss = self._calculate_loss(main_out, targets)
+            
+            # Calculate losses for auxiliary outputs (with reduced weights)
+            aux_loss = 0.0
+            if isinstance(aux_outputs, tuple):
+                # Multiple auxiliary outputs (deep supervision)
+                aux_weights = [0.4, 0.3, 0.2]  # Decreasing weights for deeper outputs
+                for i, aux_out in enumerate(aux_outputs):
+                    weight = aux_weights[i] if i < len(aux_weights) else 0.1
+                    aux_loss += weight * self._calculate_loss(aux_out, targets)
+            else:
+                # Single auxiliary output
+                aux_loss = 0.4 * self._calculate_loss(aux_outputs, targets)
+                
+            # Combine main and auxiliary losses
+            return main_loss + aux_loss
+        else:
+            # Single output - just calculate loss normally
+            return self._calculate_loss(inputs, targets)
+    
+    def _calculate_loss(self, inputs, targets):
+        # Get device from targets (safer than assuming inputs is a tensor)
+        device = targets.device
+        
+        # Calculate regular losses
+        focal_loss = self.focal(inputs, targets)
+        dice_loss = self.dice(inputs, targets)
+        boundary_loss = self.boundary._single_loss(inputs, targets)
+        
+        # Apply small object weighting to focal loss component
+        if isinstance(focal_loss, torch.Tensor) and focal_loss.requires_grad:
+            # Get the batch size
+            batch_size = targets.size(0)
+            small_object_weight = torch.ones_like(targets).float().to(device)
+            
+            # Use connected components to identify small objects - process on CPU
+            targets_np = targets.detach().cpu().numpy()
+            
+            for b in range(batch_size):
+                # Create binary masks for water classes (both perm and flood)
+                water_mask = (targets_np[b] == 1) | (targets_np[b] == 2)
+                
+                # Skip if no water pixels
+                if not np.any(water_mask):
+                    continue
+                    
+                # Find connected components
+                from scipy import ndimage
+                labels, num = ndimage.label(water_mask)
+                
+                # Calculate sizes
+                sizes = ndimage.sum(water_mask, labels, range(1, num+1))
+                
+                # Boost weights for small objects
+                for i, size in enumerate(sizes):
+                    if size < 200:  # Small object threshold
+                        # Convert back to tensor indexing - create a mask for this object
+                        obj_mask = torch.from_numpy(labels == (i+1)).to(device)
+                        small_object_weight[b][obj_mask] = self.small_object_boost
+            
+            # Recompute the focal component with manual small object weighting
+            log_probs = F.log_softmax(inputs, dim=1)
+            probs = torch.exp(log_probs)
+            
+            # Create mask for ignored indices
+            mask = (targets != self.ignore_index).float()
+            
+            # One-hot encoding of targets
+            num_classes = inputs.shape[1]
+            targets_one_hot = F.one_hot(
+                torch.clamp(targets, 0, num_classes - 1), 
+                num_classes=num_classes
+            ).permute(0, 3, 1, 2).float()
+            
+            # Apply focal weighting with small object boost
+            focal_weight = (1 - probs) ** 2.5  # focal_gamma
+            
+            # Weight small objects more heavily
+            small_obj_expanded = small_object_weight.unsqueeze(1).expand(-1, num_classes, -1, -1)
+            focal_weight = focal_weight * small_obj_expanded
+            
+            # Apply class weights
+            weighted_focal = -focal_weight * targets_one_hot * log_probs
+            if self.weight is not None:
+                weighted_focal = weighted_focal * self.weight.view(1, -1, 1, 1)
+            
+            # Apply ignore mask and reduce
+            weighted_focal = weighted_focal * mask.unsqueeze(1)
+            small_obj_focal_loss = weighted_focal.sum() / (mask.sum() + 1e-8)
+            
+            # Replace the original focal loss
+            focal_loss = small_obj_focal_loss
+        
+        # Combine losses with adjusted weights to emphasize small objects and boundaries
+        combined_loss = 0.4 * focal_loss + 0.3 * dice_loss + 0.3 * boundary_loss
+        
+        return combined_loss
+
+class BoundaryAwareLoss(nn.Module):
+    def __init__(self, weight=None, ignore_index=255, boundary_weight=5.0):
+        super(BoundaryAwareLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
+        self.boundary_weight = boundary_weight
+        self.ignore_index = ignore_index
+        
+    def forward(self, inputs, targets):
+        # Handle tuple inputs (for auxiliary outputs)
+        if isinstance(inputs, tuple):
+            main_out, aux_out = inputs
+            # Calculate loss for main and auxiliary outputs
+            main_loss = self._single_loss(main_out, targets)
+            aux_loss = self._single_loss(aux_out, targets)
+            # Combine with auxiliary loss weighted by 0.4
+            return main_loss + 0.4 * aux_loss
+        else:
+            return self._single_loss(inputs, targets)
+    
+    def _single_loss(self, inputs, targets):
+        # Standard cross-entropy loss
+        ce_loss = self.ce_loss(inputs, targets)
+        
+        # Compute boundary mask
+        with torch.no_grad():
+            # Extract water class for boundary calculation
+            # For binary or multiclass, always use class 1 (permanent water)
+            water_mask = (targets == 1).float()
+            
+            # Create boundary mask using dilation & erosion
+            dilated = F.max_pool2d(water_mask, kernel_size=3, stride=1, padding=1)
+            eroded = -F.max_pool2d(-water_mask, kernel_size=3, stride=1, padding=1)
+            
+            boundary_mask = (dilated - eroded).clamp(min=0)
+            
+            # Ignore no-data regions
+            valid_mask = (targets != self.ignore_index).float()
+            boundary_mask = boundary_mask * valid_mask
+            
+            # Apply boundary weight
+            weight_mask = torch.ones_like(ce_loss)
+            weight_mask = weight_mask + self.boundary_weight * boundary_mask
+        
+        # Apply weighted loss
+        weighted_loss = ce_loss * weight_mask
+        
+        # Take mean over valid regions
+        final_loss = weighted_loss.sum() / (valid_mask.sum() + 1e-8)
+        
+        return final_loss
+
+class FloodSpecificLoss(nn.Module):
+    def __init__(self, weight=None, ignore_index=255, flood_weight=4.0, perm_weight=2.0, focal_gamma=2.0):
+        super(FloodSpecificLoss, self).__init__()
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.flood_weight = flood_weight
+        self.perm_weight = perm_weight
+        self.focal_gamma = focal_gamma
+        
+    def forward(self, inputs, targets):
+        # Handle tuple inputs (for auxiliary outputs)
+        if isinstance(inputs, tuple):
+            main_out, aux_out = inputs
+            main_loss = self._calculate_loss(main_out, targets)
+            aux_loss = self._calculate_loss(aux_out, targets)
+            return main_loss + 0.4 * aux_loss
+        else:
+            return self._calculate_loss(inputs, targets)
+    
+    def _calculate_loss(self, inputs, targets):
+        # Get probabilities
+        log_softmax = F.log_softmax(inputs, dim=1)
+        probs = torch.exp(log_softmax)
+        
+        # Create a mask for ignored indices
+        mask = (targets != self.ignore_index).float()
+        
+        # One-hot encoding of targets
+        targets_one_hot = F.one_hot(
+            torch.clamp(targets, 0, inputs.shape[1] - 1), 
+            num_classes=inputs.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        
+        # Apply focal weighting
+        focal_weight = (1 - probs)**self.focal_gamma
+        
+        # Apply class-specific weights for flood and permanent water
+        if self.weight is not None:
+            # Use provided weight tensor
+            loss_weights = self.weight.view(1, -1, 1, 1)
+        else:
+            # Create custom weights based on flood and perm values
+            loss_weights = torch.ones(1, inputs.shape[1], 1, 1, device=probs.device)
+            if inputs.shape[1] > 2:  # Multi-class case
+                loss_weights[0, 1, :, :] = self.perm_weight  # Weight for permanent water
+                loss_weights[0, 2, :, :] = self.flood_weight  # Weight for flood water
+            else:  # Binary case
+                loss_weights[0, 1, :, :] = self.perm_weight  # Weight for water class
+        
+        # Calculate weighted focal loss
+        focal_loss = -focal_weight * targets_one_hot * log_softmax * loss_weights
+        
+        # Apply ignore mask
+        focal_loss = focal_loss * mask.unsqueeze(1)
+        
+        # Reduce appropriately
+        return focal_loss.sum() / (mask.sum() + 1e-8)
+
+
+#######################
+# Utility Functions
+#######################
+def evaluate_with_configuration(model, test_loader, criterion, device, num_classes, input_config="full", use_crf=False):
+    """
+    Evaluate model with different input configurations
+    
+    Args:
+        model: The trained model
+        test_loader: Test data loader
+        criterion: Loss function
+        device: Device to use
+        num_classes: Number of classes
+        input_config: 'full' (use all channels) or 'sar_only' (use only SAR channels)
+        use_crf: Whether to use CRF post-processing
+    """
+    model.eval()
+    running_loss = 0.0
+    running_ious = [0.0] * (num_classes - 1)  # Skip background
+    running_mean_iou = 0.0
+    running_accuracy = 0.0
+    count = 0
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(test_loader, desc=f"Evaluating with {input_config}"):
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Modify inputs based on configuration
+            if input_config == "sar_only":
+                # Create a mask to zero out non-SAR channels if more than 2 channels
+                if inputs.shape[1] > 2:
+                    # Create a copy of the inputs tensor with zeroes in non-SAR channels
+                    modified_inputs = torch.zeros_like(inputs)
+                    # Copy only the first 2 channels (SAR VV and VH)
+                    modified_inputs[:, :2] = inputs[:, :2]
+                    inputs = modified_inputs
+            
+            # Forward pass
+            outputs = model(inputs)
+            
+            # Multi-scale inference for better results
+            outputs = multi_scale_inference(
+                model, 
+                inputs, 
+                device, 
+                num_classes, 
+                scales=[1.0],  # Use just one scale for speed
+                use_flip=True,
+                use_crf=use_crf
+            )
+            
+            # Calculate loss - handle tuple outputs
+            if isinstance(outputs, tuple):
+                # Just use the main output for loss calculation in evaluation
+                criterion_inputs = outputs[0]
+            else:
+                criterion_inputs = outputs
+                
+            loss = criterion(criterion_inputs, targets)
+            
+            # Calculate metrics
+            class_ious, mean_iou = compute_iou(outputs, targets, device, num_classes)
+            accuracy = compute_accuracy(outputs, targets, device).item()
+            
+            # Update running metrics
+            running_loss += loss.item()
+            running_mean_iou += mean_iou.item()
+            
+            for i, iou in enumerate(class_ious):
+                running_ious[i] += iou.item()
+                
+            running_accuracy += accuracy
+            count += 1
+    
+    # Calculate average metrics
+    avg_loss = running_loss / count
+    avg_ious = [iou / count for iou in running_ious]
+    avg_mean_iou = running_mean_iou / count
+    avg_acc = running_accuracy / count
+    
+    # Print class IoUs
+    class_names = ['Permanent Water', 'Flood'] if num_classes > 2 else ['Water']
+    print(f"\nEvaluation with {input_config} inputs:")
+    print(f"Loss: {avg_loss:.4f}, Mean IoU: {avg_mean_iou:.4f}, Accuracy: {avg_acc:.4f}")
+    print("Class IoUs:")
+    for i, (cls_name, iou) in enumerate(zip(class_names, avg_ious)):
+        print(f"  {cls_name}: {iou:.4f}")
+    
+    return avg_loss, avg_ious, avg_mean_iou, avg_acc
+
+def visualize_with_configuration(model, dataset, device, save_path=None, num_samples=3, input_config="full"):
+    """Create visualizations with different input configurations"""
+    plt.figure(figsize=(15, 5*num_samples))
+    model.eval()
+    
+    # Get random samples
+    indices = np.random.choice(len(dataset), min(num_samples, len(dataset)), replace=False)
+    
+    for i, idx in enumerate(indices):
+        # Get a sample
+        image, mask = dataset[idx]
+        
+        # Make a copy of the image for visualization
+        display_image = image.clone()
+        
+        # Modify inputs based on configuration
+        if input_config == "sar_only":
+            # Create a modified version with only SAR channels
+            if image.shape[0] > 2:
+                # Zero out non-SAR channels (keep only first 2)
+                modified_image = torch.zeros_like(image)
+                modified_image[:2] = image[:2]
+                image = modified_image
+        
+        # Move to device and add batch dimension
+        image = image.unsqueeze(0).to(device)
+        
+        # Get model prediction
+        with torch.no_grad():
+            output = model(image)
+            # Handle tuple outputs
+            if isinstance(output, tuple):
+                output = output[0]  # Use main output
+            pred_mask = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+        
+        # Convert tensors to numpy for visualization
+        display_image_np = display_image.cpu().numpy()
+        mask_np = mask.cpu().numpy()
+        
+        # Create RGB visualization of masks
+        # Define colors for each class: [background, perm water, flood]
+        colors = [
+            [0, 0, 0],        # Background: black
+            [0, 0, 255],      # Permanent water: blue
+            [255, 0, 0]       # Flood: red
+        ]
+        
+        # Convert class indices to RGB
+        rgb_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+        rgb_pred = np.zeros((pred_mask.shape[0], pred_mask.shape[1], 3), dtype=np.uint8)
+        
+        # Assign colors to each class
+        num_classes = len(colors)
+        for cls_idx, color in enumerate(colors):
+            if cls_idx < num_classes:  # Only use valid classes
+                rgb_mask[mask_np == cls_idx] = color
+                rgb_pred[pred_mask == cls_idx] = color
+                
+        # Set no-data (255) areas to gray in ground truth
+        rgb_mask[mask_np == 255] = [128, 128, 128]
+        
+        # Plot the results
+        plt.subplot(num_samples, 3, i*3 + 1)
+        # For SAR data (2 channels), create a composite RGB
+        if display_image_np.shape[0] == 2:
+            # Use VV for red, VH for green, and average for blue
+            img_rgb = np.zeros((display_image_np.shape[1], display_image_np.shape[2], 3))
+            img_rgb[:, :, 0] = display_image_np[0]  # VV -> Red
+            img_rgb[:, :, 1] = display_image_np[1]  # VH -> Green
+            img_rgb[:, :, 2] = (display_image_np[0] + display_image_np[1]) / 2  # Average -> Blue
+            plt.imshow(img_rgb)
+        else:
+            # If more than 3 channels, just use first 3 or fewer
+            num_channels = min(3, display_image_np.shape[0])
+            img_display = np.zeros((display_image_np.shape[1], display_image_np.shape[2], 3))
+            for c in range(num_channels):
+                img_display[:, :, c] = display_image_np[c]
+            plt.imshow(img_display)
+        plt.title(f'Input Image ({input_config})')
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3 + 2)
+        plt.imshow(rgb_mask)
+        plt.title('Ground Truth')
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3 + 3)
+        plt.imshow(rgb_pred)
+        plt.title('Prediction')
+        plt.axis('off')
+    
+    plt.tight_layout()
+    
+    # Save the figure if a path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Visualization saved to {save_path}")
+    
+    plt.close()
+
+def multi_scale_inference(model, img, device, num_classes, scales=[0.75, 1.0, 1.25, 1.5], use_flip=True, use_crf=False):
+    """Run inference at multiple scales and merge results for better accuracy"""
+    # Convert to torch tensor if numpy array
+    if isinstance(img, np.ndarray):
+        img = torch.from_numpy(img).float()
+    
+    # Add batch dimension if needed
+    if len(img.shape) == 3:
+        img = img.unsqueeze(0)
+    
+    img = img.to(device)
+    
+    # Base image size - fix: get batch size from input
+    b, _, h, w = img.shape
+    
+    # Initialize output probabilities with correct batch size
+    final_prob = torch.zeros((b, num_classes, h, w), device=device)
+    
+    # Run inference at different scales
+    for scale in scales:
+        # Scale the image
+        if scale != 1.0:
+            scaled_img = F.interpolate(img, scale_factor=scale, 
+                                      mode='bilinear', align_corners=True)
+        else:
+            scaled_img = img
+        
+        # Regular forward pass
+        with torch.no_grad():
+            output = model(scaled_img)
+            if isinstance(output, tuple):
+                output = output[0]  # Get main output if tuple
+            
+            # Scale back to original size
+            if scale != 1.0:
+                output = F.interpolate(output, size=(h, w), 
+                                     mode='bilinear', align_corners=True)
+            
+            prob = F.softmax(output, dim=1)
+            final_prob += prob
+        
+        # Horizontal flip augmentation
+        if use_flip:
+            # Flip the image
+            flipped_img = torch.flip(scaled_img, dims=[3])
+            
+            # Forward pass on flipped image
+            with torch.no_grad():
+                flipped_output = model(flipped_img)
+                if isinstance(flipped_output, tuple):
+                    flipped_output = flipped_output[0]
+                
+                # Scale back to original size
+                if scale != 1.0:
+                    flipped_output = F.interpolate(flipped_output, size=(h, w), 
+                                                 mode='bilinear', align_corners=True)
+                
+                # Flip back the output
+                flipped_output = torch.flip(flipped_output, dims=[3])
+                
+                prob = F.softmax(flipped_output, dim=1)
+                final_prob += prob
+    
+    # Average the probabilities
+    div_factor = len(scales) * (2 if use_flip else 1)
+    final_prob /= div_factor
+    
+    # Apply CRF if requested
+    if use_crf:
+        # Process each sample in the batch
+        final_output = []
+        for b_idx in range(img.size(0)):
+            # Get this sample's input and output
+            img_sample = img[b_idx].cpu().numpy()
+            prob_sample = final_prob[b_idx].unsqueeze(0).cpu().numpy()
+            
+            # Apply optimized CRF
+            refined_prob = apply_crf(
+                image=img_sample, 
+                pred_prob=prob_sample, 
+                n_classes=num_classes
+            )
+            
+            # Convert back to tensor
+            final_output.append(torch.from_numpy(refined_prob).to(device))
+        
+        # Stack back to batch
+        final_prob = torch.stack(final_output, dim=0)
+    
+    # Output either probabilities or predicted classes
+    return final_prob
+
+def getArrFlood(fname):
+    """Load GeoTIFF data with error handling"""
+    if not os.path.exists(fname):
+        print(f"File not found: {fname}")
+        return None
+    
+    try:
+        with rasterio.open(fname) as src:
+            # Read data
+            arr = src.read()  # Read all bands (shape: [C, H, W])
+            
+            # Apply appropriate scale factors if available
+            if hasattr(src, 'scales'):
+                for i, scale in enumerate(src.scales):
+                    if scale != 1:
+                        arr[i] = arr[i] * scale
+                        
+            # Check for and replace NaN values
+            if np.isnan(arr).any():
+                arr = np.nan_to_num(arr)
+                        
+        return arr
+    except Exception as e:
+        print(f"Error reading file {fname}: {e}")
+        return None
+
+
+def enhance_sar_for_small_features(image):
+    """Enhanced preprocessing specifically for small water features in SAR images"""
+    # Check if input has channels dimension
+    if len(image.shape) == 3:
+        # Assume [C, H, W] format
+        if image.shape[0] <= 4:  # Reasonable number of channels
+            enhanced = np.zeros_like(image)
+            for i in range(image.shape[0]):
+                enhanced[i] = enhance_sar_channel(image[i])
+            return enhanced
+        else:  # Assume [H, W, C] format
+            enhanced = np.zeros_like(image)
+            for i in range(image.shape[2]):
+                enhanced[:, :, i] = enhance_sar_channel(image[:, :, i])
+            return enhanced
+    else:
+        # Single channel
+        return enhance_sar_channel(image)
+
+def enhance_sar_channel(channel):
+    """Enhance a single SAR channel for better water feature detection"""
+    # 1. Adaptive contrast enhancement
+    p2, p98 = np.percentile(channel, (2, 98))
+    image_rescale = np.clip((channel - p2) / (p98 - p2 + 1e-8), 0, 1)
+    
+    # 2. Bilateral filtering to preserve edges while reducing noise
+    try:
+        from skimage.restoration import denoise_bilateral
+        denoised = denoise_bilateral(image_rescale, sigma_spatial=1.5, 
+                                     sigma_color=0.1, win_size=5)
+    except ImportError:
+        from scipy.ndimage import median_filter
+        denoised = median_filter(image_rescale, size=3)
+    
+    # 3. Edge enhancement for better water boundaries
+    try:
+        from skimage import filters
+        edges = filters.sobel(denoised)
+        # Add weighted edges to enhance boundaries
+        enhanced = denoised + 0.08 * edges
+        enhanced = np.clip(enhanced, 0, 1)
+    except ImportError:
+        enhanced = denoised
+    
+    # 4. Local adaptive histogram equalization for further contrast boost
+    try:
+        from skimage import exposure
+        # Apply CLAHE for better local contrast
+        enhanced = exposure.equalize_adapthist(enhanced, clip_limit=0.02)
+    except ImportError:
+        pass
+    
+    return enhanced
+
+def sar_normalize(image, clip_min=-50, clip_max=1, enhance_small_features=True):
+    """Normalize SAR image with appropriate clipping, scaling, and enhancement"""
+    # Clip values to sensible range for SAR
+    clipped = np.clip(image, clip_min, clip_max)
+    
+    # Normalize to [0, 1]
+    normalized = (clipped - clip_min) / (clip_max - clip_min)
+    
+    # Apply enhancement for small water features if requested
+    if enhance_small_features:
+        return enhance_sar_for_small_features(normalized)
+    else:
+        return normalized
+
+
+def apply_lee_filter(image, size=5):
+    """
+    Apply Lee filter for SAR speckle reduction
+    """
+    try:
+        # Try to use actual Lee filter if available
+        from skimage import restoration
+        
+        # Ensure image is in the right format for filtering
+        if len(image.shape) == 3:  # Multiple channels
+            if image.shape[0] <= 4:  # [C, H, W] format
+                filtered = np.zeros_like(image)
+                for i in range(image.shape[0]):
+                    filtered[i] = restoration.denoise_nl_means(image[i], patch_size=5, patch_distance=7, h=0.1)
+            else:  # [H, W, C] format
+                filtered = np.zeros_like(image)
+                for i in range(image.shape[2]):
+                    filtered[:, :, i] = restoration.denoise_nl_means(image[:, :, i], patch_size=5, patch_distance=7, h=0.1)
+        else:  # Single channel
+            filtered = restoration.denoise_nl_means(image, patch_size=5, patch_distance=7, h=0.1)
+        
+        return filtered
+        
+    except (ImportError, AttributeError):
+        # Fall back to median filter which is available in all scikit-image versions
+        try:
+            from scipy.ndimage import median_filter
+            
+            # Ensure image is in the right format for filtering
+            if len(image.shape) == 3:  # Multiple channels
+                if image.shape[0] <= 4:  # [C, H, W] format
+                    filtered = np.zeros_like(image)
+                    for i in range(image.shape[0]):
+                        filtered[i] = median_filter(image[i], size=3)
+                else:  # [H, W, C] format
+                    filtered = np.zeros_like(image)
+                    for i in range(image.shape[2]):
+                        filtered[:, :, i] = median_filter(image[:, :, i], size=3)
+            else:  # Single channel
+                filtered = median_filter(image, size=3)
+                
+            return filtered
+            
+        except ImportError:
+            # If all else fails, just return the original image
+            print("Warning: Neither Lee filter nor median filter available. Using original image.")
+            return image
+
+
+def enhance_sar_contrast(image, lower_percent=2, upper_percent=98):
+    """Enhance contrast in SAR imagery using percentile-based stretching"""
+    if len(image.shape) == 3:  # [C, H, W] or [H, W, C]
+        if image.shape[0] == 2:  # [C, H, W]
+            flat_image = image.reshape(image.shape[0], -1)
+            min_vals = np.percentile(flat_image, lower_percent, axis=1)
+            max_vals = np.percentile(flat_image, upper_percent, axis=1)
+            
+            # Apply enhancement per channel
+            result = image.copy()
+            for i in range(image.shape[0]):
+                channel = image[i]
+                result[i] = np.clip((channel - min_vals[i]) / (max_vals[i] - min_vals[i] + 1e-8), 0, 1)
+        else:  # [H, W, C]
+            flat_image = image.reshape(-1, image.shape[2])
+            min_vals = np.percentile(flat_image, lower_percent, axis=0)
+            max_vals = np.percentile(flat_image, upper_percent, axis=0)
+            
+            # Apply enhancement per channel
+            result = image.copy()
+            for i in range(image.shape[2]):
+                channel = image[:, :, i]
+                result[:, :, i] = np.clip((channel - min_vals[i]) / (max_vals[i] - min_vals[i] + 1e-8), 0, 1)
+    else:
+        # Single channel image
+        min_val = np.percentile(image, lower_percent)
+        max_val = np.percentile(image, upper_percent)
+        result = np.clip((image - min_val) / (max_val - min_val + 1e-8), 0, 1)
+    
+    return result
+
+
+def apply_morphological_cleaning(mask, min_size=10):
+    """Apply morphological operations to clean up the prediction"""
+    # Remove small objects
+    cleaned = morphology.remove_small_objects(mask, min_size=min_size)
+    # Close holes
+    cleaned = morphology.closing(cleaned, morphology.disk(2))
+    # Remove small holes
+    cleaned = morphology.remove_small_holes(cleaned, area_threshold=min_size)
+    
+    return cleaned
+
+
+# CRF Postprocessing
+try:
+    import pydensecrf.densecrf as dcrf
+    from pydensecrf.utils import unary_from_softmax
+    
+    def apply_crf(image, pred_prob, n_classes, gt_prob=None):
+        """Apply CRF post-processing with parameters tuned for flood detection"""
+        try:
+            # Handle batch dimension if present
+            if len(pred_prob.shape) == 4 and pred_prob.shape[0] == 1:
+                pred_prob = pred_prob.squeeze(0)  # Remove batch dimension
+            
+            # Make arrays contiguous
+            pred_prob = np.ascontiguousarray(pred_prob)
+            
+            # Convert image to appropriate format for CRF
+            if len(image.shape) == 3 and image.shape[0] <= 5:  # [C, H, W] format
+                img = image.transpose(1, 2, 0)
+            else:
+                img = image
+                
+            # Create a 3-channel version of the image optimized for water detection
+            # For 5-channel input: SAR (VV, VH), NDWI, JRC, OTSU
+            if img.shape[2] >= 5:
+                # Use SAR VV, NDWI, and OTSU channels which are most relevant for water
+                img_3ch = np.zeros((*img.shape[:-1], 3), dtype=img.dtype)
+                img_3ch[..., 0] = img[..., 0]  # VV
+                img_3ch[..., 1] = img[..., 2]  # NDWI
+                img_3ch[..., 2] = img[..., 4]  # OTSU
+                img = img_3ch
+            elif img.shape[2] > 3:
+                img = img[:, :, :3]
+            elif img.shape[2] < 3:
+                # If fewer than 3 channels, repeat the available ones
+                img = np.repeat(img, 3, axis=2)[:, :, :3]
+                    
+            # Make img contiguous
+            img = np.ascontiguousarray(img)
+                    
+            # Scale to 0-255 if needed
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            
+            # Get dimensions
+            h, w = pred_prob.shape[1], pred_prob.shape[2]
+            
+            # Create CRF
+            d = dcrf.DenseCRF2D(w, h, n_classes)
+            
+            # Set unary potentials
+            U = unary_from_softmax(pred_prob)
+            d.setUnaryEnergy(U)
+            
+            # Parameters tuned for flood detection:
+            # - Larger spatial sigma (sxy) to enforce more spatial continuity
+            # - Lower compatibility to be more conservative with changes
+            
+            # Add pairwise potentials - reduced weight for smoother results
+            d.addPairwiseGaussian(sxy=(5, 5), compat=2)  # Increased spatial sigma, decreased compat
+            
+            # Bilateral term - carefully tuned for water features
+            # Lower srgb to be more sensitive to small color differences (water vs land)
+            d.addPairwiseBilateral(sxy=(90, 90), srgb=(5, 5, 5), rgbim=img, compat=7)
+            
+            # Perform inference (more iterations for better convergence)
+            Q = d.inference(7)  # Increased from 5 to 7
+            
+            return np.array(Q).reshape((n_classes, h, w))
+        except Exception as e:
+            print(f"CRF error: {e}. Falling back to original probabilities.")
+            return pred_prob  # Fall back to original probabilities if CRF fails
+
+
+except ImportError:
+    print("Warning: pydensecrf not installed. CRF post-processing will not be available.")
+    def apply_crf(image, pred_prob, n_classes, gt_prob=None):
+        """Dummy function when CRF is not available"""
+        return pred_prob
+
+# Add this function to evaluate whether CRF helps or hurts for each validation batch
+def compare_crf_performance(original_pred, crf_pred, targets, device, num_classes):
+    """Compare performance with and without CRF"""
+    # Calculate IoU for original predictions
+    orig_class_ious, orig_mean_iou = compute_iou(original_pred, targets, device, num_classes)
+    
+    # Calculate IoU for CRF-processed predictions
+    crf_class_ious, crf_mean_iou = compute_iou(crf_pred, targets, device, num_classes)
+    
+    # Determine if CRF improved results
+    improved = crf_mean_iou > orig_mean_iou
+    
+    return {
+        'original_miou': orig_mean_iou.item(),
+        'crf_miou': crf_mean_iou.item(),
+        'improved': improved,
+        'diff': (crf_mean_iou - orig_mean_iou).item()
+    }
+
+def calculate_ndwi(nir_band, green_band, method='ndwi'):
+    """
+    Calculate water indices for improved water detection
+    
+    Args:
+        nir_band: Near-infrared band
+        green_band: Green band
+        method: Which water index to compute:
+                'ndwi' - Normalized Difference Water Index (McFeeters)
+                'mndwi' - Modified NDWI (when SWIR band is provided instead of NIR)
+                'ndpi' - Normalized Difference Polarization Index (for SAR)
+    
+    Returns:
+        water_index: Computed water index scaled to [0, 1]
+    """
+    # Avoid division by zero
+    valid_mask = np.logical_and(np.isfinite(nir_band), np.isfinite(green_band))
+    valid_mask = np.logical_and(valid_mask, (nir_band + green_band) != 0)
+    
+    water_index = np.zeros_like(nir_band, dtype=np.float32)
+    
+    if method.lower() == 'ndwi':
+        # Standard NDWI (McFeeters, 1996): (Green-NIR)/(Green+NIR)
+        # Higher values indicate water
+        water_index[valid_mask] = (green_band[valid_mask] - nir_band[valid_mask]) / (green_band[valid_mask] + nir_band[valid_mask])
+    
+    elif method.lower() == 'mndwi':
+        # Modified NDWI: (Green-SWIR)/(Green+SWIR)
+        # Here we treat nir_band as SWIR band if method is mndwi
+        water_index[valid_mask] = (green_band[valid_mask] - nir_band[valid_mask]) / (green_band[valid_mask] + nir_band[valid_mask])
+    
+    elif method.lower() == 'ndpi' and nir_band.shape == green_band.shape:
+        # For SAR: (VV-VH)/(VV+VH) - using VV as nir_band and VH as green_band
+        water_index[valid_mask] = (nir_band[valid_mask] - green_band[valid_mask]) / (nir_band[valid_mask] + green_band[valid_mask])
+    
+    else:
+        # Default to standard NDWI
+        water_index[valid_mask] = (green_band[valid_mask] - nir_band[valid_mask]) / (green_band[valid_mask] + nir_band[valid_mask])
+    
+    # Clip values to [-1, 1] range
+    water_index = np.clip(water_index, -1, 1)
+    
+    # Scale to [0, 1] for model input
+    water_index = (water_index + 1) / 2
+    
+    return water_index
+
+
+def load_data_from_csv(csv_path, s1_dir, label_dir, optical_dir=None, jrc_dir=None, is_flood=True, max_samples=None):
+    """Load data from CSV file with S1Hand, LabelHand, and optionally JRCWaterHand"""
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        return []
+    
+    # Read CSV file
+    data_pairs = []
+    try:
+        # Read the CSV using pandas
+        df = pd.read_csv(csv_path)
+        
+        # Get column names
+        columns = df.columns.tolist()
+        
+        # Check if we have the expected columns
+        if len(columns) < 2:
+            print(f"CSV doesn't have enough columns: {columns}")
+            return []
+            
+        # Process each row
+        for _, row in df.iterrows():
+            s1_file = row[columns[0]]  # S1Hand file
+            label_file = row[columns[1]]  # LabelHand file
+            jrc_file = row[columns[2]] if len(columns) > 2 else None  # JRCWaterHand file if available
+            
+            # Construct absolute paths
+            s1_path = os.path.join(s1_dir, s1_file)
+            label_path = os.path.join(label_dir, label_file)
+            
+            # Get base name from S1 file (without extension and suffix)
+            base_name = s1_file.split('_S1Hand')[0]
+            
+            # Construct optical path using the same basename
+            optical_path = None
+            if optical_dir:
+                optical_file = f"{base_name}_S2Hand.tif"
+                optical_path = os.path.join(optical_dir, optical_file)
+            
+            # Construct JRC water path
+            jrc_path = None
+            if jrc_dir and jrc_file:
+                jrc_path = os.path.join(jrc_dir, jrc_file)
+            
+            # Check if required files exist
+            if os.path.exists(s1_path) and os.path.exists(label_path):
+                data_pairs.append((s1_path, label_path, optical_path, jrc_path, is_flood))
+            else:
+                if not os.path.exists(s1_path):
+                    print(f"S1 file not found: {s1_path}")
+                if not os.path.exists(label_path):
+                    print(f"Label file not found: {label_path}")
+                
+    except Exception as e:
+        print(f"Error reading CSV file {csv_path}: {e}")
+    
+    # Limit samples if requested
+    if max_samples is not None and len(data_pairs) > max_samples:
+        random.shuffle(data_pairs)
+        data_pairs = data_pairs[:max_samples]
+    
+    print(f"Loaded {len(data_pairs)} samples from {csv_path}")
+    return data_pairs
+
+
+def analyze_water_content(label_path, jrc_path=None, is_flood=True, boost_perm_water=True):
+    """
+    Analyze water content in a label mask, distinguishing flood from permanent water
+    with improved handling of JRC permanent water
+    """
+    try:
+        # Load label mask
+        label_arr = getArrFlood(label_path)
+        if label_arr is None:
+            return None
+            
+        # Load JRC permanent water if available
+        jrc_arr = None
+        if jrc_path and os.path.exists(jrc_path) and boost_perm_water:
+            jrc_arr = getArrFlood(jrc_path)
+            
+            # Ensure JRC mask is 2D
+            if jrc_arr is not None and len(jrc_arr.shape) > 2:
+                jrc_arr = jrc_arr.squeeze()
+                
+            # Convert to binary mask
+            if jrc_arr is not None:
+                jrc_arr = (jrc_arr > 0).astype(np.uint8)
+            
+        # Ensure label is 2D
+        if len(label_arr.shape) > 2:
+            label_arr = label_arr.squeeze()
+        
+        # Convert -1 values to 255 (no data) in labels
+        label_arr[label_arr == -1] = 255
+        
+        # Get a modifiable copy
+        label_arr_modified = label_arr.copy()
+        
+        # If JRC water is available, use it to identify permanent water
+        if jrc_arr is not None and boost_perm_water:
+            # Where JRC shows water, mark as permanent water (class 1)
+            # Only do this for valid pixels (not in no-data regions)
+            valid_mask = (label_arr != 255)
+            # For pixels that are marked as water in labels and also in JRC,
+            # force these to be permanent water
+            water_mask = (label_arr == 1) & valid_mask
+            perm_water_mask = jrc_arr & water_mask
+            
+            # Update the label array - this will make some flood pixels into perm water
+            label_arr_modified[perm_water_mask] = 1
+        
+        # For multi-class scenario (with class 1 = perm water, class 2 = flood)
+        if args.num_classes > 2:
+            if is_flood:
+                # If it's a flood sample, water pixels not marked as perm are flood (class 2)
+                water_mask = (label_arr_modified == 1)
+                valid_mask = (label_arr_modified != 255)
+                
+                # Manually separate permanent water using JRC
+                if jrc_arr is not None and boost_perm_water:
+                    # Pixels that are water in both label and JRC are perm water
+                    perm_water_mask = jrc_arr & water_mask
+                    # Remaining water pixels are flood
+                    flood_mask = water_mask & (~perm_water_mask)
+                    
+                    # Mark in the label array
+                    label_arr_modified[perm_water_mask] = 1  # Permanent water
+                    label_arr_modified[flood_mask] = 2       # Flood water
+                else:
+                    # Without JRC, assume all water pixels in flood samples are flood
+                    label_arr_modified[water_mask] = 2  # All to flood class
+                
+                # Count pixel types
+                perm_pixels = np.sum(perm_water_mask) if jrc_arr is not None else 0
+                flood_pixels = np.sum(water_mask) - perm_pixels
+                water_pixels = perm_pixels + flood_pixels
+                valid_pixels = np.sum(valid_mask)
+                
+            else:
+                # If it's a permanent water sample, water pixels are permanent water (class 1)
+                water_mask = (label_arr_modified == 1)
+                valid_mask = (label_arr_modified != 255)
+                
+                water_pixels = np.sum(water_mask)
+                valid_pixels = np.sum(valid_mask)
+                flood_pixels = 0  # No flood in permanent water samples
+                perm_pixels = water_pixels
+        else:
+            # Binary classification (simpler case)
+            water_mask = (label_arr_modified == 1)
+            valid_mask = (label_arr_modified != 255)
+            
+            water_pixels = np.sum(water_mask)
+            valid_pixels = np.sum(valid_mask)
+            
+            # For binary, still track separate statistics even though not used in model
+            if is_flood:
+                if jrc_arr is not None and boost_perm_water:
+                    perm_pixels = np.sum(jrc_arr & water_mask)
+                    flood_pixels = water_pixels - perm_pixels
+                else:
+                    flood_pixels = water_pixels
+                    perm_pixels = 0
+            else:
+                flood_pixels = 0
+                perm_pixels = water_pixels
+        
+        # Skip samples with no valid pixels
+        if valid_pixels == 0:
+            return None
+        
+        # Calculate percentages
+        water_percent = water_pixels / valid_pixels if valid_pixels > 0 else 0
+        flood_percent = flood_pixels / valid_pixels if valid_pixels > 0 else 0
+        perm_percent = perm_pixels / valid_pixels if valid_pixels > 0 else 0
+        
+        return {
+            'water_pixels': water_pixels,
+            'flood_pixels': flood_pixels,
+            'perm_pixels': perm_pixels,
+            'valid_pixels': valid_pixels,
+            'water_percent': water_percent,
+            'flood_percent': flood_percent,
+            'perm_percent': perm_percent,
+            'modified_label': label_arr_modified  # Return the modified label array
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing {label_path}: {e}")
+        return None
+
+def filter_by_water_content(data_pairs, min_water_percent=0.01):
+    """Filter data pairs by minimum water percentage"""
+    filtered_pairs = []
+    
+    for data_pair in tqdm(data_pairs, desc="Filtering by water content"):
+        img_path, label_path, optical_path, jrc_path, is_flood = data_pair
+        stats = analyze_water_content(label_path, jrc_path, is_flood, boost_perm_water=True)
+        if stats and stats['water_percent'] >= min_water_percent:
+            filtered_pairs.append((img_path, label_path, optical_path, jrc_path, is_flood, stats))
+    
+    print(f"Filtered to {len(filtered_pairs)} samples with at least {min_water_percent:.1%} water content")
+    return filtered_pairs
+
+
+class WaterDataset(Dataset):
+    """Enhanced dataset class with better handling of perm/flood water classification"""
+    
+    def __init__(self, data_samples, augment=True, patch_size=256, 
+                 augmentation_level='strong', boost_perm_water=True, 
+                 min_flood_percent=0.001, balance_classes=True):
+        self.samples = data_samples
+        self.augment = augment
+        self.patch_size = patch_size
+        self.augmentation_level = augmentation_level
+        self.boost_perm_water = boost_perm_water
+        self.min_flood_percent = min_flood_percent
+        self.balance_classes = balance_classes
+        
+        # Calculate dataset statistics
+        self.water_pixels_total = sum(s[5]['water_pixels'] for s in self.samples)
+        self.flood_pixels_total = sum(s[5]['flood_pixels'] for s in self.samples)
+        self.perm_pixels_total = sum(s[5]['perm_pixels'] for s in self.samples)
+        self.valid_pixels_total = sum(s[5]['valid_pixels'] for s in self.samples)
+        
+        # Calculate pixel ratios for class weighting
+        if self.valid_pixels_total > 0:
+            self.water_ratio = self.water_pixels_total / self.valid_pixels_total
+            self.flood_ratio = self.flood_pixels_total / self.valid_pixels_total
+            self.perm_ratio = self.perm_pixels_total / self.valid_pixels_total
+            self.bg_ratio = 1.0 - self.water_ratio
+        else:
+            self.water_ratio = 0.0
+            self.flood_ratio = 0.0
+            self.perm_ratio = 0.0
+            self.bg_ratio = 1.0
+        
+        # Dramatically increase weight for permanent water if it's underrepresented
+        perm_multiplier = 1.0
+        if self.perm_ratio < 0.05 and self.boost_perm_water:
+            # Boost permanent water weight if it's very rare
+            perm_multiplier = 3.0
+            print(f"Boosting permanent water weight by {perm_multiplier}x due to low representation")
+        
+        # Calculate class weights
+        if args.num_classes > 2:
+            # Multi-class scenario
+            if args.perm_water_weight is not None and args.flood_water_weight is not None:
+                self.perm_weight = args.perm_water_weight * perm_multiplier
+                self.flood_weight = args.flood_water_weight
+            else:
+                # Inverse frequency weighting with ceiling and boosting
+                self.perm_weight = min(10.0, self.bg_ratio / max(0.01, self.perm_ratio) * perm_multiplier)
+                self.flood_weight = min(8.0, self.bg_ratio / max(0.01, self.flood_ratio))
+                
+            self.class_weights = torch.tensor([1.0, self.perm_weight, self.flood_weight])
+        else:
+            # Binary scenario
+            if args.perm_water_weight is not None:
+                self.water_weight = args.perm_water_weight
+            else:
+                # Inverse frequency weighting with ceiling
+                self.water_weight = min(5.0, self.bg_ratio / max(0.01, self.water_ratio))
+                
+            self.class_weights = torch.tensor([1.0, self.water_weight])
+            
+        # Calculate input channels
+        self.in_channels = 2  # Default: VV and VH bands from S1Hand
+        if args.include_ndwi:
+            self.in_channels += 1  # Add NDWI channel from S2Hand
+        if args.include_jrc:
+            self.in_channels += 1  # Add JRC permanent water channel
+        
+        print(f"Dataset initialized with {len(self.samples)} samples")
+        print(f"Input channels: {self.in_channels} (SAR: 2, NDWI: {1 if args.include_ndwi else 0}, JRC: {1 if args.include_jrc else 0})")
+        print(f"Water pixel ratio: {self.water_ratio:.2%}")
+        if args.num_classes > 2:
+            print(f"Permanent water ratio: {self.perm_ratio:.2%}")
+            print(f"Flood water ratio: {self.flood_ratio:.2%}")
+            print(f"Class weights: Background={self.class_weights[0]:.2f}, Perm Water={self.class_weights[1]:.2f}, Flood={self.class_weights[2]:.2f}")
+        else:
+            print(f"Class weights: Background={self.class_weights[0]:.2f}, Water={self.class_weights[1]:.2f}")
+        
+        # Calculate sample weights for balanced sampling - important for permanent water
+        if self.balance_classes:
+            self.sample_weights = self._calculate_sample_weights()
+    
+    def _calculate_sample_weights(self):
+        """Calculate sample weights based on class representation for balanced sampling"""
+        weights = []
+        
+        for s in self.samples:
+            stats = s[5]  # Changed from s[6] to s[5]
+            # Prioritize samples with permanent water
+            if stats['perm_percent'] > 0:
+                # Higher weight for samples with permanent water
+                weights.append(3.0)
+            elif stats['flood_percent'] > 0:
+                # Normal weight for samples with flood
+                weights.append(1.0)
+            else:
+                # Lower weight for samples with no water
+                weights.append(0.5)
+        
+        return weights
+        
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        s1_path, label_path, optical_path, jrc_path, is_flood, stats = self.samples[idx]
+        
+        try:
+            # Load S1Hand SAR image
+            s1_arr = getArrFlood(s1_path)
+            if s1_arr is None:
+                return self._create_dummy_data()
+            
+            # Check if we have a modified label from analysis
+            if 'modified_label' in stats:
+                label_arr = stats['modified_label'].copy()  # Create a copy to avoid negative strides
+            else:
+                # Load LabelHand mask
+                label_arr = getArrFlood(label_path)
+                if label_arr is None:
+                    return self._create_dummy_data()
+                
+                # Ensure label is 2D
+                if len(label_arr.shape) > 2:
+                    label_arr = label_arr.squeeze()
+                    
+                # Convert -1 values to 255 (no data) in labels
+                label_arr = label_arr.copy()  # Create a copy to avoid negative strides
+                label_arr[label_arr == -1] = 255
+            
+            # Load JRC permanent water with high priority
+            jrc_arr = None
+            if args.include_jrc and jrc_path and os.path.exists(jrc_path):
+                jrc_arr = getArrFlood(jrc_path)
+                if jrc_arr is not None:
+                    # Ensure JRC mask is 2D
+                    if len(jrc_arr.shape) > 2:
+                        jrc_arr = jrc_arr.squeeze()
+                    
+                    # Create a copy to avoid negative strides
+                    jrc_arr = jrc_arr.copy()
+                    
+                    # Normalize JRC data to [0, 1]
+                    jrc_arr = (jrc_arr > 0).astype(np.float32)
+                    
+                    # Use JRC to explicitly identify permanent water in the label
+                    if args.num_classes > 2 and self.boost_perm_water:
+                        # Copy label to avoid modifying original
+                        label_arr_copy = label_arr.copy()
+                        
+                        # Where both JRC and label show water, mark as permanent water (class 1)
+                        valid_mask = (label_arr != 255)
+                        water_mask = (label_arr == 1) & valid_mask
+                        perm_water_mask = (jrc_arr > 0) & water_mask
+                        
+                        # Mark permanent water in label
+                        label_arr_copy[perm_water_mask] = 1
+                        
+                        # If it's a flood sample, mark remaining water as flood
+                        if is_flood:
+                            flood_mask = water_mask & (~perm_water_mask)
+                            label_arr_copy[flood_mask] = 2
+                        
+                        # Use the modified label
+                        label_arr = label_arr_copy
+            
+            # Enhanced normalization of SAR data for small water features
+            s1_arr = s1_arr.copy()  # Create a copy to avoid negative strides
+            s1_arr = sar_normalize(s1_arr, clip_min=-50, clip_max=1, enhance_small_features=True)
+            
+            # Transpose if needed to [H, W, C] format for processing
+            if len(s1_arr.shape) == 3 and s1_arr.shape[0] == 2:
+                # From [C, H, W] to [H, W, C]
+                s1_arr = s1_arr.transpose(1, 2, 0).copy()  # Create explicit copy after transpose
+            
+            # Initialize combined_input with SAR data
+            if len(s1_arr.shape) == 3 and s1_arr.shape[2] == 2:
+                combined_input = s1_arr.copy()  # Ensure we have a copy, not a view
+            else:
+                if len(s1_arr.shape) == 3:  # [C, H, W]
+                    combined_input = s1_arr.transpose(1, 2, 0).copy()
+                else:  # Single channel case
+                    combined_input = s1_arr.reshape(s1_arr.shape[0], s1_arr.shape[1], 1).copy()
+            
+            # Load and process S2Hand optical data for NDWI if requested
+            if args.include_ndwi and optical_path and os.path.exists(optical_path):
+                optical_arr = getArrFlood(optical_path)
+                if optical_arr is not None:
+                    # Create a copy to avoid negative strides
+                    optical_arr = optical_arr.copy()
+                    
+                    # For Sentinel-2 data, assuming standard band order:
+                    # Band 3 is Green, Band 8 is NIR
+                    green_band = optical_arr[2].copy() if optical_arr.shape[0] >= 3 else None
+                    nir_band = optical_arr[7].copy() if optical_arr.shape[0] >= 8 else None
+                    
+                    if nir_band is not None and green_band is not None:
+                        ndwi = calculate_ndwi(nir_band, green_band, method=args.water_index)
+                        ndwi = ndwi.reshape(ndwi.shape[0], ndwi.shape[1], 1).copy()
+                        combined_input = np.concatenate([combined_input, ndwi], axis=2).copy()
+                    else:
+                        # If proper bands are not available, add zeros as placeholder
+                        zeros = np.zeros((combined_input.shape[0], combined_input.shape[1], 1), dtype=combined_input.dtype)
+                        combined_input = np.concatenate([combined_input, zeros], axis=2).copy()
+                        print(f"Warning: Proper bands not found in optical data {optical_path}")
+            
+            # Load and process JRCWaterHand data if requested - amplify its signal
+            if args.include_jrc and jrc_arr is not None:
+                # Amplify JRC channel for clearer permanent water signal
+                jrc_arr = jrc_arr * 5.0  # This boosts the JRC signal significantly
+                jrc_arr = jrc_arr.reshape(jrc_arr.shape[0], jrc_arr.shape[1], 1).copy()
+                combined_input = np.concatenate([combined_input, jrc_arr], axis=2).copy()
+            
+            # Apply water-focused data augmentation
+            if self.augment:
+                combined_input, label_arr = self.water_focused_augmentation(combined_input, label_arr)
+                
+                # Convert to tensors
+                combined_input = np.transpose(combined_input, (2, 0, 1)).copy()  # [H, W, C] -> [C, H, W]
+                image_tensor = torch.from_numpy(combined_input).float()
+                mask_tensor = torch.from_numpy(label_arr).long()
+            else:
+                # Center crop for test/validation
+                h, w = combined_input.shape[0], combined_input.shape[1]
+                
+                if h > self.patch_size and w > self.patch_size:
+                    # Center crop
+                    top = (h - self.patch_size) // 2
+                    left = (w - self.patch_size) // 2
+                    combined_input = combined_input[top:top+self.patch_size, left:left+self.patch_size, :].copy()
+                    label_arr = label_arr[top:top+self.patch_size, left:left+self.patch_size].copy()
+                
+                # Convert to PyTorch tensors
+                combined_input = np.transpose(combined_input, (2, 0, 1)).copy()  # [H, W, C] -> [C, H, W]
+                image_tensor = torch.from_numpy(combined_input).float()
+                mask_tensor = torch.from_numpy(label_arr).long()
+                
+                # Resize if needed
+                if image_tensor.shape[1] != self.patch_size or image_tensor.shape[2] != self.patch_size:
+                    image_tensor = F.interpolate(
+                        image_tensor.unsqueeze(0), 
+                        size=(self.patch_size, self.patch_size), 
+                        mode='bilinear', 
+                        align_corners=True
+                    ).squeeze(0)
+                    
+                    mask_tensor = F.interpolate(
+                        mask_tensor.float().unsqueeze(0).unsqueeze(0), 
+                        size=(self.patch_size, self.patch_size), 
+                        mode='nearest'
+                    ).squeeze(0).squeeze(0).long()
+            
+            # Ensure mask has the right values
+            mask_tensor[mask_tensor > args.num_classes] = 255  # Set invalid to 255
+            
+            return image_tensor, mask_tensor
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            return self._create_dummy_data()
+    
+    def water_focused_augmentation(self, image, mask):
+        """Custom augmentation techniques optimized for water body detection"""
+        # Create copies to avoid negative strides
+        image = image.copy()
+        mask = mask.copy()
+        
+        # Ensure we have enough image size for cropping
+        h, w = image.shape[0], image.shape[1]
+        
+        # Random cropping specifically around water areas when possible
+        if h > self.patch_size and w > self.patch_size:
+            # Identify water pixels
+            water_pixels = np.where((mask == 1) | (mask == 2))
+            
+            if len(water_pixels[0]) > 0 and random.random() < 0.8:
+                # Randomly select a water pixel as the center of the crop
+                idx = random.randint(0, len(water_pixels[0]) - 1)
+                center_y, center_x = water_pixels[0][idx], water_pixels[1][idx]
+                
+                # Calculate crop boundaries, ensuring they are within the image
+                half_size = self.patch_size // 2
+                top = max(0, min(h - self.patch_size, center_y - half_size))
+                left = max(0, min(w - self.patch_size, center_x - half_size))
+            else:
+                # Random crop if no water pixels or with small probability
+                top = random.randint(0, h - self.patch_size)
+                left = random.randint(0, w - self.patch_size)
+            
+            # Perform the crop (with copy to avoid negative strides)
+            image = image[top:top+self.patch_size, left:left+self.patch_size, :].copy()
+            mask = mask[top:top+self.patch_size, left:left+self.patch_size].copy()
+        
+        # Specialized augmentations for water detection
+        
+        # 1. Random flips
+        if random.random() < 0.5:
+            image = np.flip(image, axis=0).copy()  # Create a copy after flip
+            mask = np.flip(mask, axis=0).copy()    # Create a copy after flip
+        
+        if random.random() < 0.5:
+            image = np.flip(image, axis=1).copy()  # Create a copy after flip
+            mask = np.flip(mask, axis=1).copy()    # Create a copy after flip
+        
+        # 2. Random rotations for water bodies (less than 90° to avoid too much padding)
+        if random.random() < 0.3:
+            angle = random.uniform(-45, 45)
+            # Convert to PIL images for rotation
+            image_channels = []
+            for c in range(image.shape[2]):
+                channel = image[..., c]
+                pil_channel = Image.fromarray((channel * 255).astype(np.uint8))
+                rotated_channel = pil_channel.rotate(angle, resample=Image.BILINEAR)
+                image_channels.append(np.array(rotated_channel).astype(np.float32) / 255.0)
+            
+            image = np.stack(image_channels, axis=2).copy()  # Create a copy after stacking
+            
+            # Rotate mask
+            pil_mask = Image.fromarray(mask.astype(np.uint8))
+            rotated_mask = pil_mask.rotate(angle, resample=Image.NEAREST)
+            mask = np.array(rotated_mask).copy()  # Create a copy after conversion
+        
+        # 3. Random brightness/contrast adjustments to simulate different water conditions
+        if random.random() < 0.5:
+            # Only apply to SAR channels (first two channels)
+            for c in range(min(2, image.shape[2])):
+                contrast = random.uniform(0.85, 1.15)
+                brightness = random.uniform(-0.05, 0.05)
+                channel = image[..., c].copy()  # Create a copy before modifying
+                channel = channel * contrast + brightness
+                image[..., c] = np.clip(channel, 0, 1)
+        
+        # 4. Cutmix augmentation for small water bodies (randomly copy water regions)
+        if random.random() < 0.2:
+            # Find water regions
+            water_pixels = np.where((mask == 1) | (mask == 2))
+            
+            if len(water_pixels[0]) > 50:  # Only if we have enough water pixels
+                # Group water pixels into connected regions
+                water_mask = np.zeros_like(mask)
+                water_mask[(mask == 1) | (mask == 2)] = 1
+                
+                try:
+                    from scipy import ndimage
+                    labeled, num_features = ndimage.label(water_mask)
+                    
+                    if num_features > 0:
+                        # Select a random water region
+                        region_idx = random.randint(1, num_features)
+                        region_mask = (labeled == region_idx)
+                        
+                        # Calculate region bounding box
+                        y_indices, x_indices = np.where(region_mask)
+                        y_min, y_max = np.min(y_indices), np.max(y_indices)
+                        x_min, x_max = np.min(x_indices), np.max(x_indices)
+                        
+                        # Copy this region to a new random location
+                        new_y = random.randint(0, mask.shape[0] - (y_max - y_min) - 1)
+                        new_x = random.randint(0, mask.shape[1] - (x_max - x_min) - 1)
+                        
+                        # Extract region data
+                        region_h, region_w = y_max - y_min + 1, x_max - x_min + 1
+                        for c in range(image.shape[2]):
+                            # Copy image data
+                            image[new_y:new_y+region_h, new_x:new_x+region_w, c] = \
+                                image[y_min:y_max+1, x_min:x_max+1, c] * region_mask[y_min:y_max+1, x_min:x_max+1]
+                        
+                        # Copy mask
+                        mask[new_y:new_y+region_h, new_x:new_x+region_w] = \
+                            mask[y_min:y_max+1, x_min:x_max+1] * region_mask[y_min:y_max+1, x_min:x_max+1]
+                except ImportError:
+                    pass  # Skip if scipy not available
+        
+        # 5. Small noise to improve generalization
+        if random.random() < 0.6:
+            noise = np.random.normal(0, 0.03, image.shape)
+            image = image + noise
+            image = np.clip(image, 0, 1)
+        
+        return image.copy(), mask.copy()  # Return explicit copies
+
+    def _create_dummy_data(self):
+        """Create dummy data for error cases"""
+        return (torch.zeros((self.in_channels, self.patch_size, self.patch_size)), 
+                torch.zeros((self.patch_size, self.patch_size), dtype=torch.long))
+                
+
+def compute_iou(outputs, targets, device, num_classes):
+    """Compute IoU for multiple classes with robust shape handling"""
+    # Handle tuple outputs (for auxiliary outputs)
+    if isinstance(outputs, tuple):
+        outputs = outputs[0]  # Use main output
+        
+    # Get predictions using argmax
+    predictions = torch.argmax(outputs, dim=1)  # [B, H, W]
+    
+    # Initialize IoU accumulators for each class (excluding background)
+    total_intersection = torch.zeros(num_classes-1, dtype=torch.float32, device=device)
+    total_union = torch.zeros(num_classes-1, dtype=torch.float32, device=device)
+    
+    # Process each batch item separately to avoid broadcasting issues
+    batch_size = predictions.shape[0]
+    for b in range(batch_size):
+        # Get single image prediction and target
+        pred = predictions[b]  # [H, W]
+        target = targets[b]    # [H, W]
+        
+        # Create valid mask (excluding no data values)
+        valid_mask = (target != 255)
+        
+        # Calculate IoU for each class (excluding background)
+        for c in range(1, num_classes):  # Skip class 0 (background)
+            class_idx = c - 1  # Index for our IoU arrays
+            
+            # Create binary masks for this class
+            pred_mask = (pred == c) & valid_mask
+            target_mask = (target == c) & valid_mask
+            
+            # Calculate intersection and union
+            intersection = torch.logical_and(pred_mask, target_mask).sum().float()
+            union = torch.logical_or(pred_mask, target_mask).sum().float()
+            
+            # Accumulate results
+            total_intersection[class_idx] += intersection
+            total_union[class_idx] += union
+    
+    # Calculate IoU for each class
+    class_ious = []
+    for i in range(num_classes-1):
+        if total_union[i] == 0:
+            class_ious.append(torch.tensor(0.0, device=device))
+        else:
+            iou = (total_intersection[i] + 1e-8) / (total_union[i] + 1e-8)
+            class_ious.append(iou)
+    
+    # Calculate mean IoU
+    mean_iou = torch.stack(class_ious).mean() if class_ious else torch.tensor(0.0, device=device)
+    
+    return class_ious, mean_iou
+
+
+def compute_accuracy(outputs, targets, device):
+    """Compute pixel-wise accuracy with robust shape handling"""
+    # Handle tuple outputs (for auxiliary outputs)
+    if isinstance(outputs, tuple):
+        outputs = outputs[0]  # Use main output
+        
+    # Get predictions using argmax
+    predictions = torch.argmax(outputs, dim=1)  # [B, H, W]
+    
+    # Initialize counters
+    total_correct = 0
+    total_valid = 0
+    
+    # Process each batch item separately
+    batch_size = predictions.shape[0]
+    for b in range(batch_size):
+        # Get single image prediction and target
+        pred = predictions[b]  # [H, W]
+        target = targets[b]    # [H, W]
+        
+        # Create valid mask (excluding no data values)
+        valid_mask = (target != 255)
+        
+        # Skip if no valid pixels
+        if valid_mask.sum() == 0:
+            continue
+        
+        # Count correct predictions (only for valid pixels)
+        correct = torch.sum((pred == target) & valid_mask).float()
+        valid = valid_mask.sum().float()
+        
+        # Accumulate totals
+        total_correct += correct
+        total_valid += valid
+    
+    # Calculate accuracy
+    if total_valid == 0:
+        return torch.tensor(0.0, device=device)
+    
+    return total_correct / total_valid
+
+def create_unified_metrics_plot(epoch, train_losses, val_losses, train_ious, val_ious, 
+                              train_class_ious, val_class_ious, train_accs, val_accs, 
+                              learning_rates, class_names, save_path):
+    """
+    Create a unified plot with all training metrics in a single file.
+    Ensures that all validation metrics are properly displayed.
+    """
+    plt.figure(figsize=(15, 12))
+    
+    # Plot loss
+    plt.subplot(3, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Plot mean IoU
+    plt.subplot(3, 2, 2)
+    plt.plot(train_ious, label='Train mIoU')
+    plt.plot(val_ious, label='Val mIoU')
+    plt.xlabel('Epoch')
+    plt.ylabel('mIoU')
+    plt.legend()
+    plt.title('Mean IoU Curves')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Plot class IoUs
+    plt.subplot(3, 2, 3)
+    for i, class_name in enumerate(class_names):
+        if i < len(train_class_ious):
+            plt.plot(train_class_ious[i], label=f'Train {class_name} IoU')
+        if i < len(val_class_ious):
+            plt.plot(val_class_ious[i], label=f'Val {class_name} IoU')
+    plt.xlabel('Epoch')
+    plt.ylabel('Class IoU')
+    plt.legend()
+    plt.title('Class IoU Curves')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Plot Accuracy
+    plt.subplot(3, 2, 4)
+    plt.plot(train_accs, label='Train Acc')
+    plt.plot(val_accs, label='Val Acc')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Accuracy Curves')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Plot learning rate
+    plt.subplot(3, 2, 5)
+    plt.semilogy(learning_rates)
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Schedule')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Add metrics summary
+    plt.subplot(3, 2, 6)
+    plt.axis('off')
+    
+    # Create summary text with all current metrics
+    metrics_text = [
+        f"Current Epoch: {epoch+1}",
+        f"Train Loss: {train_losses[-1]:.4f}",
+        f"Val Loss: {val_losses[-1]:.4f}",
+        f"Train mIoU: {train_ious[-1]:.4f}",
+        f"Val mIoU: {val_ious[-1]:.4f}",
+        f"Train Acc: {train_accs[-1]:.4f}",
+        f"Val Acc: {val_accs[-1]:.4f}",
+        f"Learning Rate: {learning_rates[-1]:.2e}"
+    ]
+    
+    # Add per-class IoU metrics to summary
+    for i, class_name in enumerate(class_names):
+        if i < len(train_class_ious) and train_class_ious[i]:
+            metrics_text.append(f"Train {class_name} IoU: {train_class_ious[i][-1]:.4f}")
+        if i < len(val_class_ious) and val_class_ious[i]:
+            metrics_text.append(f"Val {class_name} IoU: {val_class_ious[i][-1]:.4f}")
+    
+    plt.text(0.1, 0.5, "\n".join(metrics_text), fontsize=12, va='center')
+    plt.title('Current Metrics Summary')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+def compare_crf_performance(original_outputs, refined_outputs, targets, device, num_classes):
+    """Compare if CRF post-processing improved the predictions"""
+    # Handle tuple outputs (for auxiliary outputs)
+    if isinstance(original_outputs, tuple):
+        original_outputs = original_outputs[0]  # Use main output
+    
+    # Calculate IoU for original and refined outputs
+    _, original_miou = compute_iou(original_outputs, targets, device, num_classes)
+    _, refined_miou = compute_iou(refined_outputs, targets, device, num_classes)
+    
+    # Calculate difference
+    diff = refined_miou.item() - original_miou.item()
+    
+    return {
+        'improved': diff > 0,
+        'diff': diff,
+        'original_miou': original_miou.item(),
+        'refined_miou': refined_miou.item()
+    }
+
+def validate(model, val_loader, criterion, device, num_classes, use_crf=False):
+    """Validate the model with multi-scale inference and robust CRF tracking"""
+    model.eval()
+    running_loss = 0.0
+    running_ious = [0.0] * (num_classes - 1)  # Skip background
+    running_mean_iou = 0.0
+    running_accuracy = 0.0
+    count = 0
+    
+    # Track CRF performance
+    crf_helps_count = 0
+    crf_total_count = 0
+    crf_improvement = 0.0
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(val_loader, desc="Validating"):
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Use multi-scale inference for better results
+            outputs = multi_scale_inference(
+                model, 
+                inputs, 
+                device, 
+                num_classes, 
+                scales=[1.0],  # Start with just one scale for speed
+                use_flip=True,
+                use_crf=False  # We'll handle CRF separately
+            )
+            
+            # Save original outputs before any post-processing
+            original_outputs = outputs
+            
+            # Apply CRF post-processing if enabled
+            if use_crf:
+                # Process each sample in the batch
+                refined_outputs = []
+                
+                for i in range(inputs.size(0)):
+                    # Get this sample's input and output
+                    input_sample = inputs[i].cpu().numpy()
+                    
+                    # Handle output format
+                    if isinstance(outputs, tuple):
+                        # Get primary output if tuple (for OCR model)
+                        output_prob = F.softmax(outputs[0][i].unsqueeze(0), dim=1).cpu().numpy()
+                    else:
+                        output_prob = F.softmax(outputs[i].unsqueeze(0), dim=1).cpu().numpy()
+                    
+                    # Apply optimized CRF
+                    refined_prob = apply_crf(
+                        image=input_sample, 
+                        pred_prob=output_prob, 
+                        n_classes=num_classes
+                    )
+                    
+                    # Convert back to tensor
+                    refined_outputs.append(torch.from_numpy(refined_prob).to(device))
+                
+                # Stack back to batch
+                refined_outputs = torch.stack(refined_outputs, dim=0)
+                
+                # Optional: Evaluate if CRF is helping or hurting
+                crf_performance = compare_crf_performance(
+                    original_outputs, 
+                    refined_outputs, 
+                    targets, 
+                    device, 
+                    num_classes
+                )
+                
+                crf_total_count += 1
+                if crf_performance['improved']:
+                    crf_helps_count += 1
+                    crf_improvement += crf_performance['diff']
+                
+                # Use refined outputs
+                if isinstance(outputs, tuple):
+                    outputs = (refined_outputs, outputs[1])  # Keep auxiliary output
+                else:
+                    outputs = refined_outputs
+            
+            # Log-softmax for loss calculation
+            if isinstance(outputs, torch.Tensor) and outputs.shape[1] == num_classes:
+                log_outputs = F.log_softmax(outputs, dim=1)
+                criterion_inputs = log_outputs
+            else:
+                criterion_inputs = outputs
+            
+            # Calculate loss
+            loss = criterion(criterion_inputs, targets)
+            
+            # Calculate metrics
+            class_ious, mean_iou = compute_iou(outputs, targets, device, num_classes)
+            accuracy = compute_accuracy(outputs, targets, device).item()
+            
+            # Track metrics
+            running_loss += loss.item()
+            running_mean_iou += mean_iou.item()
+            
+            for i, iou in enumerate(class_ious):
+                running_ious[i] += iou.item()
+                
+            running_accuracy += accuracy
+            count += 1
+    
+    # Calculate average metrics
+    avg_loss = running_loss / count
+    avg_ious = [iou / count for iou in running_ious]
+    avg_mean_iou = running_mean_iou / count
+    avg_acc = running_accuracy / count
+    
+    # Print class IoUs with permanent water highlighted
+    class_names = ['Permanent Water', 'Flood'] if num_classes > 2 else ['Water']
+    print("Validation class IoUs:")
+    for i, (cls_name, iou) in enumerate(zip(class_names, avg_ious)):
+        print(f"  {cls_name}: {iou:.4f}")
+    
+    # Print CRF effectiveness stats
+    if use_crf and crf_total_count > 0:
+        print(f"CRF improved results in {crf_helps_count}/{crf_total_count} batches ({crf_helps_count/crf_total_count*100:.1f}%)")
+        if crf_helps_count > 0:
+            print(f"Average improvement when CRF helps: {crf_improvement/crf_helps_count:.4f} mIoU")
+    
+    return avg_loss, avg_ious, avg_mean_iou, avg_acc
+
+def visualize_prediction(model, dataset, device, save_path=None, num_samples=3):
+    """Create and save visualizations of model predictions"""
+    plt.figure(figsize=(15, 5*num_samples))
+    model.eval()
+    
+    # Get a random sample from the dataset
+    indices = np.random.choice(len(dataset), min(num_samples, len(dataset)), replace=False)
+    
+    for i, idx in enumerate(indices):
+        # Get a sample
+        image, mask = dataset[idx]
+        
+        # Move to device and add batch dimension
+        image = image.unsqueeze(0).to(device)
+        
+        # Get model prediction
+        with torch.no_grad():
+            output = model(image)
+            # Handle tuple outputs (for OCR model)
+            if isinstance(output, tuple):
+                output = output[0]  # Use main output
+            pred_mask = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+        
+        # Convert tensors to numpy for visualization
+        image_np = image.squeeze().cpu().numpy()
+        mask_np = mask.cpu().numpy()
+        
+        # Create RGB visualization of masks
+        # Define colors for each class: [background, perm water, flood]
+        colors = [
+            [0, 0, 0],        # Background: black
+            [0, 0, 255],      # Permanent water: blue
+            [255, 0, 0]       # Flood: red
+        ]
+        
+        # Convert class indices to RGB
+        rgb_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+        rgb_pred = np.zeros((pred_mask.shape[0], pred_mask.shape[1], 3), dtype=np.uint8)
+        
+        # Assign colors to each class
+        num_classes = args.num_classes
+        for cls_idx, color in enumerate(colors):
+            if cls_idx < num_classes:  # Only use valid classes
+                rgb_mask[mask_np == cls_idx] = color
+                rgb_pred[pred_mask == cls_idx] = color
+                
+        # Set no-data (255) areas to gray in ground truth
+        rgb_mask[mask_np == 255] = [128, 128, 128]
+        
+        # Plot the results
+        plt.subplot(num_samples, 3, i*3 + 1)
+        # For SAR data (2 channels), create a composite RGB
+        if image_np.shape[0] == 2:
+            # Use VV for red, VH for green, and average for blue
+            img_rgb = np.zeros((image_np.shape[1], image_np.shape[2], 3))
+            img_rgb[:, :, 0] = image_np[0]  # VV -> Red
+            img_rgb[:, :, 1] = image_np[1]  # VH -> Green
+            img_rgb[:, :, 2] = (image_np[0] + image_np[1]) / 2  # Average -> Blue
+            plt.imshow(img_rgb)
+        else:
+            # If more than 3 channels, just use first 3 or fewer
+            num_channels = min(3, image_np.shape[0])
+            img_display = np.zeros((image_np.shape[1], image_np.shape[2], 3))
+            for c in range(num_channels):
+                img_display[:, :, c] = image_np[c]
+            plt.imshow(img_display)
+        plt.title('Input Image')
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3 + 2)
+        plt.imshow(rgb_mask)
+        plt.title('Ground Truth')
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3 + 3)
+        plt.imshow(rgb_pred)
+        plt.title('Prediction')
+        plt.axis('off')
+    
+    plt.tight_layout()
+    
+    # Save the figure if a path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Visualization saved to {save_path}")
+    
+    plt.close()
+
+def test_model(model, test_loader, device, results_dir, num_classes, use_crf=False):
+    """Perform detailed evaluation on the test set"""
+    model.eval()
+    
+    # Initialize metrics accumulators for each class
+    class_metrics = {c: {'TP': 0, 'FP': 0, 'FN': 0, 'TN': 0} for c in range(1, num_classes)}
+    
+    # For visualization examples
+    visualization_samples = []
+    num_vis_samples = min(10, len(test_loader.dataset))
+    vis_indices = np.random.choice(len(test_loader.dataset), num_vis_samples, replace=False)
+    vis_count = 0
+    
+    with torch.no_grad():
+        for i, (inputs, targets) in enumerate(tqdm(test_loader, desc="Testing")):
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Forward pass
+            outputs = model(inputs)
+            
+            # Handle tuple outputs (for OCR model)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # Use main output
+            
+            # Apply CRF post-processing if enabled
+            if use_crf:
+                # Process each sample in the batch
+                refined_outputs = []
+                for j in range(inputs.size(0)):
+                    # Get this sample's input and output
+                    input_sample = inputs[j].cpu().numpy()
+                    output_prob = F.softmax(outputs[j].unsqueeze(0), dim=1).cpu().numpy()
+                    
+                    # Apply CRF
+                    refined_prob = apply_crf(
+                        image=input_sample, 
+                        pred_prob=output_prob, 
+                        n_classes=num_classes
+                    )
+                    
+                    # Convert back to tensor
+                    refined_outputs.append(torch.from_numpy(refined_prob).to(device))
+                
+                # Stack back to batch
+                outputs = torch.stack(refined_outputs, dim=0)
+            
+            # Get predictions
+            preds = torch.argmax(outputs, dim=1)
+            
+            # Process each batch item separately
+            batch_size = preds.shape[0]
+            for j in range(batch_size):
+                # Get single prediction and target
+                pred = preds[j]
+                target = targets[j]
+                
+                # Create valid mask (excluding no data values)
+                valid_mask = (target != 255)
+                
+                # Calculate confusion matrix for each class
+                for c in range(1, num_classes):  # Skip background (class 0)
+                    # Create binary masks for this class
+                    pred_mask = (pred == c) & valid_mask
+                    target_mask = (target == c) & valid_mask
+                    
+                    # Calculate TP, FP, FN, TN
+                    tp = torch.logical_and(pred_mask, target_mask).sum().item()
+                    fp = torch.logical_and(pred_mask, ~target_mask).sum().item()
+                    fn = torch.logical_and(~pred_mask, target_mask).sum().item()
+                    tn = torch.logical_and(~pred_mask, ~target_mask).sum().item()
+                    
+                    # Accumulate metrics
+                    class_metrics[c]['TP'] += tp
+                    class_metrics[c]['FP'] += fp
+                    class_metrics[c]['FN'] += fn
+                    class_metrics[c]['TN'] += tn
+                
+                # Save some samples for visualization
+                if vis_count < num_vis_samples and i * batch_size + j in vis_indices:
+                    visualization_samples.append((
+                        inputs[j].cpu(),
+                        targets[j].cpu(),
+                        outputs[j].cpu(),
+                        pred.cpu()
+                    ))
+                    vis_count += 1
+    
+    # Calculate precision, recall, F1, IoU for each class
+    class_names = ['Permanent Water', 'Flood'] if num_classes > 2 else ['Water']
+    class_precision = []
+    class_recall = []
+    class_f1 = []
+    class_iou = []
+    
+    print("\nTest Results:")
+    for i, cls in enumerate(range(1, num_classes)):
+        tp = class_metrics[cls]['TP']
+        fp = class_metrics[cls]['FP']
+        fn = class_metrics[cls]['FN']
+        tn = class_metrics[cls]['TN']
+        
+        # Calculate metrics
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+        
+        # Print metrics for this class
+        class_name = class_names[i] if i < len(class_names) else f"Class {cls}"
+        print(f"Class: {class_name}")
+        print(f"  Precision: {precision:.4f}")
+        print(f"  Recall: {recall:.4f}")
+        print(f"  F1-Score: {f1:.4f}")
+        print(f"  IoU: {iou:.4f}")
+        
+        # Store metrics
+        class_precision.append(precision)
+        class_recall.append(recall)
+        class_f1.append(f1)
+        class_iou.append(iou)
+    
+    # Calculate overall metrics
+    total_tp = sum(class_metrics[c]['TP'] for c in range(1, num_classes))
+    total_fp = sum(class_metrics[c]['FP'] for c in range(1, num_classes))
+    total_fn = sum(class_metrics[c]['FN'] for c in range(1, num_classes))
+    total_tn = sum(class_metrics[c]['TN'] for c in range(1, num_classes))
+    
+    overall_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    overall_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0
+    overall_iou = total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) > 0 else 0
+    overall_accuracy = (total_tp + total_tn) / (total_tp + total_fp + total_fn + total_tn) if (total_tp + total_fp + total_fn + total_tn) > 0 else 0
+    
+    # Print overall metrics
+    print("\nOverall Metrics:")
+    print(f"  Precision: {overall_precision:.4f}")
+    print(f"  Recall: {overall_recall:.4f}")
+    print(f"  F1-Score: {overall_f1:.4f}")
+    print(f"  IoU: {overall_iou:.4f}")
+    print(f"  Accuracy: {overall_accuracy:.4f}")
+    
+    # Generate visualization for selected samples
+    if visualization_samples:
+        visualization_path = os.path.join(results_dir, "test_samples_visualization.png")
+        plt.figure(figsize=(20, 5 * len(visualization_samples)))
+        
+        for i, (image, mask, output, pred) in enumerate(visualization_samples):
+            # Convert tensors to numpy arrays
+            image_np = image.numpy()
+            mask_np = mask.numpy()
+            
+            # Get model output probabilities
+            output_np = F.softmax(output, dim=0).numpy()
+            
+            # Get prediction as numpy array
+            pred_np = pred.numpy()
+            
+            # Create RGB visualization of masks
+            # Define colors for each class: [background, perm water, flood]
+            colors = [
+                [0, 0, 0],        # Background: black
+                [0, 0, 255],      # Permanent water: blue
+                [255, 0, 0]       # Flood: red
+            ]
+            
+            # Convert class indices to RGB
+            rgb_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+            rgb_pred = np.zeros((pred_np.shape[0], pred_np.shape[1], 3), dtype=np.uint8)
+            
+            # Assign colors to each class
+            for cls_idx, color in enumerate(colors):
+                if cls_idx < num_classes:  # Only use valid classes
+                    rgb_mask[mask_np == cls_idx] = color
+                    rgb_pred[pred_np == cls_idx] = color
+                    
+            # Set no-data (255) areas to gray in ground truth
+            rgb_mask[mask_np == 255] = [128, 128, 128]
+            
+            # Plot the input image
+            plt.subplot(len(visualization_samples), 4, i*4 + 1)
+            # For SAR data (2 channels), create a composite RGB
+            if image_np.shape[0] == 2:
+                # Use VV for red, VH for green, and average for blue
+                img_rgb = np.zeros((image_np.shape[1], image_np.shape[2], 3))
+                img_rgb[:, :, 0] = image_np[0]  # VV -> Red
+                img_rgb[:, :, 1] = image_np[1]  # VH -> Green
+                img_rgb[:, :, 2] = (image_np[0] + image_np[1]) / 2  # Average -> Blue
+                plt.imshow(img_rgb)
+            else:
+                # If more than 3 channels, just use first 3 or fewer
+                num_channels = min(3, image_np.shape[0])
+                img_display = np.zeros((image_np.shape[1], image_np.shape[2], 3))
+                for c in range(num_channels):
+                    img_display[:, :, c] = image_np[c]
+                plt.imshow(img_display)
+            plt.title('Input Image')
+            plt.axis('off')
+            
+            # Plot the ground truth mask
+            plt.subplot(len(visualization_samples), 4, i*4 + 2)
+            plt.imshow(rgb_mask)
+            plt.title('Ground Truth')
+            plt.axis('off')
+            
+            # Plot the prediction probabilities
+            plt.subplot(len(visualization_samples), 4, i*4 + 3)
+            # Create a heatmap of the water class probabilities
+            if num_classes > 2:
+                # Use permanent water + flood probabilities
+                water_prob = output_np[1] + output_np[2] if output_np.shape[0] > 2 else output_np[1]
+            else:
+                water_prob = output_np[1]
+            plt.imshow(water_prob, cmap='viridis')
+            plt.colorbar(label='Water Probability')
+            plt.title('Water Probability')
+            plt.axis('off')
+            
+            # Plot the prediction mask
+            plt.subplot(len(visualization_samples), 4, i*4 + 4)
+            plt.imshow(rgb_pred)
+            plt.title('Prediction')
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(visualization_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Test visualizations saved to {visualization_path}")
+    
+    # Create confusion matrix visualization
+    plt.figure(figsize=(10, 8))
+    for i, cls in enumerate(range(1, num_classes)):
+        class_name = class_names[i] if i < len(class_names) else f"Class {cls}"
+        tp = class_metrics[cls]['TP']
+        fp = class_metrics[cls]['FP']
+        fn = class_metrics[cls]['FN']
+        tn = class_metrics[cls]['TN']
+        
+        # Create 2x2 confusion matrix
+        cm = np.array([[tn, fp], [fn, tp]])
+        # Normalize by row (actual class)
+        cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-10)
+        
+        # Plot confusion matrix
+        ax = plt.subplot(1, num_classes-1, i+1)
+        im = ax.imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Blues, vmin=0, vmax=1)
+        
+        # Show all ticks and label them
+        ax.set(xticks=[0, 1], yticks=[0, 1],
+               xticklabels=['Not '+class_name, class_name],
+               yticklabels=['Not '+class_name, class_name],
+               title=f'Normalized Confusion Matrix - {class_name}',
+               ylabel='True label',
+               xlabel='Predicted label')
+        
+        # Rotate the tick labels and set their alignment
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        
+        # Loop over data dimensions and create text annotations
+        fmt = '.2f'
+        thresh = cm_norm.max() / 2.
+        for r in range(2):
+            for c in range(2):
+                ax.text(c, r, format(cm_norm[r, c], fmt),
+                        ha="center", va="center",
+                        color="white" if cm_norm[r, c] > thresh else "black")
+    
+    plt.tight_layout()
+    confusion_matrix_path = os.path.join(results_dir, "confusion_matrices.png")
+    plt.savefig(confusion_matrix_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrices saved to {confusion_matrix_path}")
+    
+    # Save metrics to file
+    with open(os.path.join(results_dir, "test_metrics.txt"), 'w') as f:
+        f.write("Test Results:\n\n")
+        
+        for i, cls in enumerate(range(1, num_classes)):
+            class_name = class_names[i] if i < len(class_names) else f"Class {cls}"
+            f.write(f"Class: {class_name}\n")
+            f.write(f"  Precision: {class_precision[i]:.4f}\n")
+            f.write(f"  Recall: {class_recall[i]:.4f}\n")
+            f.write(f"  F1-Score: {class_f1[i]:.4f}\n")
+            f.write(f"  IoU: {class_iou[i]:.4f}\n\n")
+        
+        f.write("Overall Metrics:\n")
+        f.write(f"  Precision: {overall_precision:.4f}\n")
+        f.write(f"  Recall: {overall_recall:.4f}\n")
+        f.write(f"  F1-Score: {overall_f1:.4f}\n")
+        f.write(f"  IoU: {overall_iou:.4f}\n")
+        f.write(f"  Accuracy: {overall_accuracy:.4f}\n")
+    
+    print(f"Test metrics saved to {os.path.join(results_dir, 'test_metrics.txt')}")
+    
+    # If enabled, also apply morphological post-processing and evaluate
+    if args.use_morphological_postprocessing:
+        print("\nApplying morphological post-processing...")
+        
+        # Initialize metrics for post-processed results
+        pp_class_metrics = {c: {'TP': 0, 'FP': 0, 'FN': 0, 'TN': 0} for c in range(1, num_classes)}
+        
+        with torch.no_grad():
+            for inputs, targets in tqdm(test_loader, desc="Post-processing"):
+                # Move data to device
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                
+                # Forward pass
+                outputs = model(inputs)
+                
+                # Handle tuple outputs (for OCR model)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]  # Use main output
+                
+                # Apply CRF if enabled
+                if use_crf:
+                    # Process each sample in the batch
+                    refined_outputs = []
+                    for j in range(inputs.size(0)):
+                        input_sample = inputs[j].cpu().numpy()
+                        output_prob = F.softmax(outputs[j].unsqueeze(0), dim=1).cpu().numpy()
+                        
+                        refined_prob = apply_crf(
+                            image=input_sample, 
+                            pred_prob=output_prob, 
+                            n_classes=num_classes
+                        )
+                        
+                        refined_outputs.append(torch.from_numpy(refined_prob).to(device))
+                    
+                    outputs = torch.stack(refined_outputs, dim=0)
+                
+                # Get predictions
+                preds = torch.argmax(outputs, dim=1)
+                
+                # Process each batch item separately
+                batch_size = preds.shape[0]
+                for j in range(batch_size):
+                    # Get single prediction and target
+                    pred = preds[j].cpu().numpy()
+                    target = targets[j].cpu().numpy()
+                    
+                    # Create valid mask (excluding no data values)
+                    valid_mask = (target != 255)
+                    
+                    # Apply morphological cleaning to predictions for each class
+                    cleaned_pred = np.zeros_like(pred)
+                    for c in range(1, num_classes):
+                        # Extract class mask
+                        class_mask = (pred == c)
+                        # Apply cleaning
+                        cleaned_mask = apply_morphological_cleaning(class_mask, min_size=args.morph_min_size)
+                        # Update cleaned prediction
+                        cleaned_pred[cleaned_mask] = c
+                    
+                    # Convert back to tensor
+                    cleaned_pred = torch.from_numpy(cleaned_pred).to(device)
+                    target_tensor = torch.from_numpy(target).to(device)
+                    
+                    # Calculate metrics for each class
+                    for c in range(1, num_classes):
+                        # Create binary masks for this class
+                        pred_mask = (cleaned_pred == c) & torch.from_numpy(valid_mask).to(device)
+                        target_mask = (target_tensor == c) & torch.from_numpy(valid_mask).to(device)
+                        
+                        # Calculate TP, FP, FN, TN
+                        tp = torch.logical_and(pred_mask, target_mask).sum().item()
+                        fp = torch.logical_and(pred_mask, ~target_mask).sum().item()
+                        fn = torch.logical_and(~pred_mask, target_mask).sum().item()
+                        tn = torch.logical_and(~pred_mask, ~target_mask).sum().item()
+                        
+                        # Accumulate metrics
+                        pp_class_metrics[c]['TP'] += tp
+                        pp_class_metrics[c]['FP'] += fp
+                        pp_class_metrics[c]['FN'] += fn
+                        pp_class_metrics[c]['TN'] += tn
+        
+        # Calculate post-processed metrics
+        pp_class_precision = []
+        pp_class_recall = []
+        pp_class_f1 = []
+        pp_class_iou = []
+        
+        print("\nPost-processed Test Results:")
+        for i, cls in enumerate(range(1, num_classes)):
+            tp = pp_class_metrics[cls]['TP']
+            fp = pp_class_metrics[cls]['FP']
+            fn = pp_class_metrics[cls]['FN']
+            tn = pp_class_metrics[cls]['TN']
+            
+            # Calculate metrics
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+            
+            # Print metrics for this class
+            class_name = class_names[i] if i < len(class_names) else f"Class {cls}"
+            print(f"Class: {class_name}")
+            print(f"  Precision: {precision:.4f}")
+            print(f"  Recall: {recall:.4f}")
+            print(f"  F1-Score: {f1:.4f}")
+            print(f"  IoU: {iou:.4f}")
+            
+            # Store metrics
+            pp_class_precision.append(precision)
+            pp_class_recall.append(recall)
+            pp_class_f1.append(f1)
+            pp_class_iou.append(iou)
+        
+        # Calculate overall post-processed metrics
+        pp_total_tp = sum(pp_class_metrics[c]['TP'] for c in range(1, num_classes))
+        pp_total_fp = sum(pp_class_metrics[c]['FP'] for c in range(1, num_classes))
+        pp_total_fn = sum(pp_class_metrics[c]['FN'] for c in range(1, num_classes))
+        pp_total_tn = sum(pp_class_metrics[c]['TN'] for c in range(1, num_classes))
+        
+        pp_overall_precision = pp_total_tp / (pp_total_tp + pp_total_fp) if (pp_total_tp + pp_total_fp) > 0 else 0
+        pp_overall_recall = pp_total_tp / (pp_total_tp + pp_total_fn) if (pp_total_tp + pp_total_fn) > 0 else 0
+        pp_overall_f1 = 2 * pp_overall_precision * pp_overall_recall / (pp_overall_precision + pp_overall_recall) if (pp_overall_precision + pp_overall_recall) > 0 else 0
+        pp_overall_iou = pp_total_tp / (pp_total_tp + pp_total_fp + pp_total_fn) if (pp_total_tp + pp_total_fp + pp_total_fn) > 0 else 0
+        pp_overall_accuracy = (pp_total_tp + pp_total_tn) / (pp_total_tp + pp_total_fp + pp_total_fn + pp_total_tn) if (pp_total_tp + pp_total_fp + pp_total_fn + pp_total_tn) > 0 else 0
+        
+        # Print overall post-processed metrics
+        print("\nOverall Post-processed Metrics:")
+        print(f"  Precision: {pp_overall_precision:.4f}")
+        print(f"  Recall: {pp_overall_recall:.4f}")
+        print(f"  F1-Score: {pp_overall_f1:.4f}")
+        print(f"  IoU: {pp_overall_iou:.4f}")
+        print(f"  Accuracy: {pp_overall_accuracy:.4f}")
+        
+        # Save post-processed metrics to file
+        with open(os.path.join(results_dir, "post_processed_metrics.txt"), 'w') as f:
+            f.write("Post-processed Test Results:\n\n")
+            
+            for i, cls in enumerate(range(1, num_classes)):
+                class_name = class_names[i] if i < len(class_names) else f"Class {cls}"
+                f.write(f"Class: {class_name}\n")
+                f.write(f"  Precision: {pp_class_precision[i]:.4f}\n")
+                f.write(f"  Recall: {pp_class_recall[i]:.4f}\n")
+                f.write(f"  F1-Score: {pp_class_f1[i]:.4f}\n")
+                f.write(f"  IoU: {pp_class_iou[i]:.4f}\n\n")
+            
+            f.write("Overall Post-processed Metrics:\n")
+            f.write(f"  Precision: {pp_overall_precision:.4f}\n")
+            f.write(f"  Recall: {pp_overall_recall:.4f}\n")
+            f.write(f"  F1-Score: {pp_overall_f1:.4f}\n")
+            f.write(f"  IoU: {pp_overall_iou:.4f}\n")
+            f.write(f"  Accuracy: {pp_overall_accuracy:.4f}\n")
+        
+        print(f"Post-processed metrics saved to {os.path.join(results_dir, 'post_processed_metrics.txt')}")
+    
+    # Return overall metrics
+    return {
+        'precision': overall_precision,
+        'recall': overall_recall,
+        'f1': overall_f1,
+        'iou': overall_iou,
+        'accuracy': overall_accuracy,
+        'class_precision': class_precision,
+        'class_recall': class_recall,
+        'class_f1': class_f1,
+        'class_iou': class_iou,
+    }
+
+
+def train_attention_unet_model():
+    """Main training function for Attention U-Net flood detection model"""
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+
+    
+    # Create output directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    CHECKPOINTS_DIR = os.path.join(args.output_dir, "checkpoints")
+    RESULTS_DIR = os.path.join(args.output_dir, "results")
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    
+    # Generate run name with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    RUN_NAME = f"AttentionUNet_HandLabeled"
+    RUN_NAME += "_NDWI" if args.include_ndwi else ""
+    RUN_NAME += "_JRC" if args.include_jrc else ""
+    RUN_NAME += f"_{timestamp}"
+    
+    # Load data from CSV files - same as the original code
+    # ... (data loading code from original function) ...
+    train_csv = os.path.join(args.data_root, "splits/flood_handlabeled/flood_train_data_with_jrc.csv")
+    val_csv = os.path.join(args.data_root, "splits/flood_handlabeled/flood_valid_data_with_jrc.csv")
+    test_csv = os.path.join(args.data_root, "splits/flood_handlabeled/flood_test_data_with_jrc.csv")
+    
+    # Check if the CSV file exists and create if needed
+    if not os.path.exists(train_csv):
+        print(f"Warning: {train_csv} not found. Attempting to create CSV files from flood_valid_data_with_jrc.csv")
+        # Use the flood_valid_data_with_jrc.csv as base for splitting
+        original_csv = os.path.join(args.data_root, "flood_valid_data_with_jrc.csv")
+        if os.path.exists(original_csv):
+            # Load the CSV
+            df = pd.read_csv(original_csv, header=None)
+            # Split into train/val/test (70/15/15)
+            from sklearn.model_selection import train_test_split
+            train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42)
+            val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+            
+            # Save CSVs
+            train_df.to_csv(train_csv, index=False, header=False)
+            val_df.to_csv(val_csv, index=False, header=False)
+            test_df.to_csv(test_csv, index=False, header=False)
+            
+            print(f"Created CSV files for training ({len(train_df)} samples), validation ({len(val_df)} samples), and testing ({len(test_df)} samples)")
+        else:
+            print(f"Error: Neither provided CSV nor {original_csv} found. Cannot proceed without data.")
+            return
+    
+    # Load data from CSV files
+    train_pairs = load_data_from_csv(
+        train_csv, 
+        args.s1_dir, 
+        args.label_dir,
+        optical_dir=args.optical_dir if args.include_ndwi else None,
+        jrc_dir=args.jrc_dir if args.include_jrc else None,
+        is_flood=True,
+        max_samples=args.max_samples
+    )
+    
+    val_pairs = load_data_from_csv(
+        val_csv, 
+        args.s1_dir, 
+        args.label_dir,
+        optical_dir=args.optical_dir if args.include_ndwi else None,
+        jrc_dir=args.jrc_dir if args.include_jrc else None,
+        is_flood=True,
+        max_samples=args.max_samples//5
+    )
+    
+    test_pairs = load_data_from_csv(
+        test_csv, 
+        args.s1_dir, 
+        args.label_dir,
+        optical_dir=args.optical_dir if args.include_ndwi else None,
+        jrc_dir=args.jrc_dir if args.include_jrc else None,
+        is_flood=True,
+        max_samples=args.max_samples//5
+    )
+    
+    if not train_pairs:
+        print("Error: No training data found.")
+        return
+        
+    print(f"Total data pairs - Train: {len(train_pairs)}, Val: {len(val_pairs)}, Test: {len(test_pairs)}")
+    
+    # Filter by water content
+    print(f"Filtering data by minimum water percentage: {args.min_water_percent*100:.1f}%")
+    train_samples = filter_by_water_content(train_pairs, args.min_water_percent)
+    val_samples = filter_by_water_content(val_pairs, args.min_water_percent)
+    test_samples = filter_by_water_content(test_pairs, args.min_water_percent)
+    
+    if not train_samples:
+        print("Error: No training samples after filtering.")
+        return
+        
+    print(f"After filtering - Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
+    
+    # Create datasets
+    print("Creating datasets...")
+    train_dataset = WaterDataset(
+        train_samples, 
+        augment=True, 
+        patch_size=args.patch_size,
+        augmentation_level=args.augmentation_intensity
+    )
+    
+    val_dataset = WaterDataset(
+        val_samples, 
+        augment=False, 
+        patch_size=args.patch_size,
+        augmentation_level='light'
+    )
+    
+    test_dataset = WaterDataset(
+        test_samples, 
+        augment=False, 
+        patch_size=args.patch_size,
+        augmentation_level='light'
+    )
+    
+    # Create data loaders
+    def worker_init_fn(worker_id):
+        np.random.seed(SEED + worker_id)
+        random.seed(SEED + worker_id)
+        
+    if hasattr(train_dataset, 'sample_weights') and train_dataset.balance_classes:
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=train_dataset.sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,  # Use weighted sampler
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+            worker_init_fn=worker_init_fn
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+            worker_init_fn=worker_init_fn
+        )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size // 2,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=worker_init_fn
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size // 2,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=worker_init_fn
+    )
+    
+    # Initialize Attention U-Net model instead of HRNetOCR
+    print(f"Initializing Attention U-Net model with {train_dataset.in_channels} input channels...")
+    model = AttentionUNet(
+        n_channels=train_dataset.in_channels,
+        n_classes=args.num_classes,
+        filters_base=args.filters_base
+    )
+    model = model.to(device)
+    
+    # Print model information
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model has {num_params:,} trainable parameters")
+    
+    # Define loss function
+    print(f"Setting up loss function: {args.loss_type}")
+    criterion = AdvancedFloodLoss(
+        weight=train_dataset.class_weights.to(device),
+        ignore_index=255,
+        small_object_boost=3.0,
+        flood_weight=args.flood_water_weight,
+        perm_weight=args.perm_water_weight,
+        focal_gamma=args.focal_gamma
+    )
+        
+    # Optimizer setup
+    print(f"Initializing optimizer with lr={args.lr}")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr, 
+        weight_decay=1e-5,
+        betas=(0.9, 0.999)
+    )
+    
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max', 
+        factor=0.5, 
+        patience=7,
+        verbose=True, 
+        min_lr=1e-7
+    )
+    
+    # Load checkpoint if provided - similar to original code
+    start_epoch = 0
+    best_val_iou = 0.0
+    if args.checkpoint_path and os.path.exists(args.checkpoint_path):
+        print(f"Loading checkpoint from {args.checkpoint_path}...")
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        
+        # Support different checkpoint formats
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # Proper state dict with metadata
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Only load optimizer and scheduler if resuming training
+            if args.resume_training:
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    # Update optimizer learning rate
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = args.lr
+                    print(f"Restored optimizer state and set LR to {args.lr}")
+                
+                if 'scheduler_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                if 'epoch' in checkpoint:
+                    start_epoch = checkpoint['epoch'] + 1
+                
+                if 'best_val_iou' in checkpoint:
+                    best_val_iou = checkpoint['best_val_iou']
+        else:
+            # Simple state dict only
+            try:
+                model.load_state_dict(checkpoint)
+                print("Loaded model weights from simple state dict")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                print("Initializing from scratch")
+            
+        print(f"Loaded checkpoint. Starting from epoch {start_epoch}, best val IoU: {best_val_iou:.4f}")
+    else:
+        print("No checkpoint provided, starting from scratch")
+    
+    # Training metrics tracking
+    train_losses = []
+    train_ious = []
+    train_class_ious = [[] for _ in range(args.num_classes - 1)]  # Skip background
+    train_accs = []
+    
+    val_losses = []
+    val_ious = []
+    val_class_ious = [[] for _ in range(args.num_classes - 1)]  # Skip background
+    val_accs = []
+    
+    learning_rates = []
+    patience_counter = 0
+    
+    # Training loop
+    print(f"Starting training for {args.epochs} epochs...")
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        running_ious = [0.0] * (args.num_classes - 1)
+        running_mean_iou = 0.0
+        running_accuracy = 0.0
+        batch_count = 0
+        
+        # Training phase
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        for inputs, targets in pbar:
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Forward pass
+            outputs = model(inputs)
+            
+            # Calculate loss
+            loss = criterion(outputs, targets)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            optimizer.step()
+            
+            # Calculate metrics
+            class_ious, mean_iou = compute_iou(outputs, targets, device, args.num_classes)
+            accuracy = compute_accuracy(outputs, targets, device).item()
+            
+            # Update running metrics
+            running_loss += loss.item()
+            running_mean_iou += mean_iou.item()
+            running_accuracy += accuracy
+            
+            for i, iou in enumerate(class_ious):
+                running_ious[i] += iou.item()
+            
+            # Update progress bar
+            batch_count += 1
+            pbar.set_postfix({
+                'loss': running_loss / batch_count,
+                'mIoU': running_mean_iou / batch_count,
+                'acc': running_accuracy / batch_count
+            })
+        
+        # Calculate average training metrics
+        avg_train_loss = running_loss / batch_count
+        avg_train_mean_iou = running_mean_iou / batch_count
+        avg_train_ious = [iou / batch_count for iou in running_ious]
+        avg_train_accuracy = running_accuracy / batch_count
+        
+        # Print training class IoUs
+        class_names = ['Permanent Water', 'Flood'] if args.num_classes > 2 else ['Water']
+        print("Training class IoUs:")
+        for i, (cls_name, iou) in enumerate(zip(class_names, avg_train_ious)):
+            print(f"  {cls_name}: {iou:.4f}")
+        
+        # Validation phase with original function
+        val_loss, val_class_iou_values, val_mean_iou, val_acc = validate(
+            model, val_loader, criterion, device, args.num_classes, use_crf=args.use_crf
+        )
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Update learning rate scheduler
+        scheduler.step(val_mean_iou)
+        
+        # Track metrics
+        train_losses.append(avg_train_loss)
+        train_ious.append(avg_train_mean_iou)
+        train_accs.append(avg_train_accuracy)
+        for i, iou in enumerate(avg_train_ious):
+            train_class_ious[i].append(iou)
+            
+        val_losses.append(val_loss)
+        val_ious.append(val_mean_iou)
+        val_accs.append(val_acc)
+        
+        # Store per-class validation IoUs
+        for i, iou in enumerate(val_class_iou_values):
+            if i < len(val_class_ious):
+                val_class_ious[i].append(iou)
+        
+        learning_rates.append(current_lr)
+        
+        # Print epoch summary
+        print(f"Epoch {epoch+1}/{args.epochs}")
+        print(f"Train Loss: {avg_train_loss:.4f}, IoU: {avg_train_mean_iou:.4f}, Acc: {avg_train_accuracy:.4f}")
+        print(f"Valid Loss: {val_loss:.4f}, IoU: {val_mean_iou:.4f}, Acc: {val_acc:.4f}")
+        print(f"Learning rate: {current_lr:.2e}")
+        
+        # Generate and save visualization every 10 epochs or at the final epoch
+        if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
+            visualize_prediction(
+                model, 
+                val_dataset, 
+                device, 
+                save_path=os.path.join(RESULTS_DIR, f"{RUN_NAME}_predictions_epoch{epoch+1}.png")
+            )
+        
+        # Create unified metrics plot
+        create_unified_metrics_plot(
+            epoch, 
+            train_losses, val_losses, 
+            train_ious, val_ious, 
+            train_class_ious, val_class_ious,
+            train_accs, val_accs,
+            learning_rates,
+            class_names,
+            save_path=os.path.join(RESULTS_DIR, f"{RUN_NAME}_metrics_epoch{epoch+1}.png")
+        )
+        
+        # Save model if improved
+        if val_mean_iou > best_val_iou:
+            print(f"Validation IoU improved from {best_val_iou:.4f} to {val_mean_iou:.4f}")
+            best_val_iou = val_mean_iou
+            patience_counter = 0
+            
+            # Save best model
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_iou': best_val_iou,
+                'val_ious': val_ious,
+            }, os.path.join(CHECKPOINTS_DIR, f"{RUN_NAME}_best.pth"))
+            
+            print(f"Saved best model to {os.path.join(CHECKPOINTS_DIR, f'{RUN_NAME}_best.pth')}")
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs")
+        
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_iou': best_val_iou,
+            }, os.path.join(CHECKPOINTS_DIR, f"{RUN_NAME}_epoch{epoch+1}.pth"))
+            
+            print(f"Saved checkpoint at epoch {epoch+1}")
+        
+        # Adjust learning rate if no improvement for a while
+        if patience_counter >= 15:
+            print(f"No improvement for {patience_counter} epochs - reducing LR by factor of 5")
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = param_group['lr'] / 5.0
+            
+            patience_counter = 0
+            print(f"New learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+            
+            # If learning rate becomes too small, stop training
+            if optimizer.param_groups[0]['lr'] < 1e-7:
+                print("Learning rate too small. Stopping training.")
+                break
+    
+    # Load best model for testing
+    print("Loading best model for testing...")
+    best_model_path = os.path.join(CHECKPOINTS_DIR, f"{RUN_NAME}_best.pth")
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded best model with validation IoU: {checkpoint['best_val_iou']:.4f}")
+    
+    # Test with each input configuration
+    print("\nEvaluating with different input configurations...")
+    for config in args.eval_configs:
+        print(f"\n=== Evaluation with {config} configuration ===")
+        # Use our new evaluation function with the specific configuration
+        test_loss, test_ious, test_mean_iou, test_acc = evaluate_with_configuration(
+            model, test_loader, criterion, device, args.num_classes, 
+            input_config=config, use_crf=args.use_crf
+        )
+        
+        # Print results for this configuration
+        print(f"Test Loss ({config}): {test_loss:.4f}, IoU: {test_mean_iou:.4f}, Acc: {test_acc:.4f}")
+        
+        # Create visualization with this configuration
+        visualize_with_configuration(
+            model, 
+            test_dataset, 
+            device, 
+            save_path=os.path.join(RESULTS_DIR, f"{RUN_NAME}_{config}_final_predictions.png"),
+            num_samples=5,
+            input_config=config
+        )
+        
+        # Save metrics to file
+        config_results_path = os.path.join(RESULTS_DIR, f"{RUN_NAME}_{config}_test_metrics.txt")
+        with open(config_results_path, 'w') as f:
+            f.write(f"Test Results with {config} inputs:\n\n")
+            
+            # Class metrics
+            class_names = ['Permanent Water', 'Flood'] if args.num_classes > 2 else ['Water']
+            for i, (cls_name, iou) in enumerate(zip(class_names, test_ious)):
+                f.write(f"Class: {cls_name}, IoU: {iou:.4f}\n")
+            
+            f.write(f"\nOverall Mean IoU: {test_mean_iou:.4f}\n")
+            f.write(f"Overall Accuracy: {test_acc:.4f}\n")
+            f.write(f"Loss: {test_loss:.4f}\n")
+        
+        print(f"Results for {config} configuration saved to {config_results_path}")
+    
+    # Detailed test evaluation with full inputs
+    print("\nPerforming detailed test evaluation with full inputs...")
+    test_metrics = test_model(
+        model, 
+        test_loader, 
+        device, 
+        RESULTS_DIR, 
+        args.num_classes,
+        use_crf=args.use_crf
+    )
+    
+    print("\nTraining and evaluation complete!")
+    print(f"Results saved to {RESULTS_DIR}")
+
+
+# Replace the original train_handlabeled_model call with our new function
+if __name__ == "__main__":
+    print("Starting Attention U-Net flood detection model training...")
+    train_attention_unet_model()
+    print("Training completed!")
