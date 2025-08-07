@@ -35,7 +35,7 @@ if torch.cuda.is_available():
 
     # Parse arguments
     parser = argparse.ArgumentParser(description='Attention U-Net for Flood Detection')
-    # Add existing arguments from original code...
+    
     parser.add_argument('--data_root', type=str, default="/mnt/z/Formal data_v1.1", help='Root data directory')
     parser.add_argument('--optical_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/S2Hand", help='Directory containing optical imagery (for NDWI)')
     parser.add_argument('--s1_dir', type=str, default="/mnt/z/Formal data_v1.1/data/flood_events/HandLabeled/S1Hand", help='Directory containing SAR imagery')
